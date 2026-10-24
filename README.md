@@ -26,7 +26,9 @@ open "app/GPU Buddy.app"
 | `GET /api/v1/usage?preset=today\|week\|month\|ytd\|total` | token usage for a period: totals, a series and a per-model breakdown |
 | `GET /api/v1/usage?from=<unix>&to=<unix>&group=hour\|day\|month` | the same for any date range |
 | `GET /api/v1/usage/summary` | token totals for today, this week, this month, YTD and all time |
+| `GET /api/v1/power` | chip power right now (GPU, CPU, Neural Engine, memory) and joules per token |
 | `GET /api/v1/stream` | Server-Sent Events, one snapshot per second |
+| `GET /api/v1/pairing` | this Mac's pairing code (only from this Mac, over 127.0.0.1) |
 
 Each process comes with its full `command`, its working directory (`cwd`) and a readable `activity`, for example `mlx_vlm.server · Qwen3-VL-8B-Instruct-4bit`, `train.py --epochs 10`, or `Running llama3.2:3b` for Ollama.
 
@@ -44,6 +46,39 @@ gpud finds local LLM servers by looking for AI-looking processes that listen on 
 **Generated** = output tokens written by the model. **Used** = prompt tokens it read. Both are counted while gpud is running.
 
 Token usage is kept **forever**, per hour and per model, so the Token Ledger can show any period. Weeks start on the day your Mac's calendar uses (`week_start=1` for Sunday, `2` for Monday in the API).
+
+## Power
+
+gpud reads the chip's own energy counters (IOReport, the same source as `powermetrics`) through a tiny helper, `daemon/gpupower.c`. gpud compiles it with `clang` on first run, and no sudo is needed. You get:
+
+| Metric | Meaning |
+|---|---|
+| GPU / CPU / Neural Engine / memory / rest-of-chip watts | live, every second, also in the 24h timeline (orange line) |
+| GPU peak | highest GPU watts since gpud started |
+| AI watts | the GPU+ANE power used by local LLM servers: their share of GPU time while they work |
+| J per token (live) | AI watts ÷ decode speed, while a model is generating |
+| tokens per Wh | the same, upside down |
+| J per token (average) | AI energy ÷ generated tokens, prompt reading included |
+| energy per model | GPU energy is assigned to the models that produced the tokens, kept forever per hour |
+
+The Token Ledger shows GPU and whole-chip energy for any period, the energy that went into tokens, what the chip's electricity cost (set your price per kWh), and what the same tokens would cost on the Claude API at list prices. The whole Mac at the wall uses more than the chip: fans, SSD, display and power-supply losses aren't included.
+
+## Watching other Macs
+
+Install gpud on every Mac you want to watch (`./install.sh`), then open GPU Buddy on any of them:
+
+1. On the Mac to be watched, open GPU Buddy → **Macs (⌘K)** and copy the pairing code under **Share this Mac** (or run `python3 daemon/gpud.py --pairing-code`).
+2. On the watching Mac, open **Macs (⌘K)**. Macs running gpud on your network show up by themselves (Bonjour). Click **Pair…** and paste the code, or add one by address (`Studio.local` or an IP).
+3. Each Mac gets a chip under Chippy with its live %. Click one, or press ⌘] / ⌘[, to switch. The Token Ledger follows the selected Mac.
+
+How it's protected:
+
+- Other Macs reach gpud over **TLS** on port 8766. The plain-HTTP API on 8765 only listens on 127.0.0.1.
+- The pairing code is a random access token plus the fingerprint of that Mac's certificate. The app checks the fingerprint before sending anything, so another machine can't pretend to be your Mac. Every request without the right token gets a 401.
+- The certificate, private key and token live in `~/Library/Application Support/GPUBuddy/` and only you can read them. Paired Macs are saved, readable only by you, in `viewer-hosts.json` in the same folder.
+- `python3 daemon/gpud.py --new-pairing-code` makes a new code (every paired Mac has to pair again). Start gpud with `--remote-port 0` to turn remote viewing off.
+- If the macOS firewall blocks incoming connections, allow Python when asked, or add it under System Settings → Network → Firewall.
+- The first time GPU Buddy looks for Macs, macOS asks for Local Network access. Allow it.
 
 GPU history is kept for 24 hours in `~/Library/Application Support/GPUBuddy/history.db` (SQLite) and survives restarts.
 

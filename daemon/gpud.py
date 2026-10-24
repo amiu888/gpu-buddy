@@ -14,19 +14,38 @@ serves them over a local HTTP API:
   GET /api/v1/usage        -> token usage for any period (?preset=today|week|month|ytd|total
                               or ?from=<unix>&to=<unix>, &group=hour|day|month)
   GET /api/v1/usage/summary -> token totals for today, this week, this month, YTD and all time
+  GET /api/v1/power        -> chip power right now (GPU, CPU, ANE, DRAM) and energy per token
+
+Power comes from IOReport's energy counters via the small gpupower helper (compiled from
+gpupower.c on first run; no sudo). GPU energy spent while a local LLM server works is assigned to
+the models that produced tokens, so the ledger can show joules per token for each model.
 
 GPU history is kept for 24 hours and token usage forever, in SQLite
 (~/Library/Application Support/GPUBuddy/history.db).
+
+Remote viewing: the same API is also served over TLS on all interfaces (--remote-port, default
+8766) for GPU Buddy apps on other Macs. Every remote request needs the pairing code's token
+(`python3 gpud.py --pairing-code` prints it); the code also carries the certificate fingerprint,
+so viewers can verify they're talking to this Mac. The service is advertised over Bonjour as
+_gpubuddy._tcp. The plain-HTTP API stays on 127.0.0.1 only.
 
 Standard library only. Run:  python3 gpud.py [--port 8765] [--interval 1.0]
 """
 
 import argparse
+import atexit
+import base64
 import datetime
+import hashlib
+import hmac
 import json
 import os
 import plistlib
+import secrets
+import signal
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
@@ -35,9 +54,12 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.4.0"
+VERSION = "1.6.0"
 RETENTION_SECONDS = 24 * 3600
-DEFAULT_DB = os.path.expanduser("~/Library/Application Support/GPUBuddy/history.db")
+STATE_DIR = os.path.expanduser("~/Library/Application Support/GPUBuddy")
+DEFAULT_DB = os.path.join(STATE_DIR, "history.db")
+BONJOUR_TYPE = "_gpubuddy._tcp"
+POWER_KEYS = ("gpu", "cpu", "ane", "dram", "other")
 
 # Process names that are almost certainly doing AI / ML work on the GPU.
 AI_HINTS = (
@@ -328,6 +350,56 @@ class TokenWatcher:
             time.sleep(max(0.05, self.interval - (time.monotonic() - t0)))
 
 
+class PowerWatcher:
+    """Chip power from the gpupower helper (IOReport energy counters, no sudo needed)."""
+
+    def __init__(self, interval=1.0):
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.latest = None  # watts per block, from the last interval
+        self.error = None
+        self._energy = dict.fromkeys(POWER_KEYS, 0.0)  # joules since the last take()
+        self._proc = None
+        atexit.register(lambda: self._proc and self._proc.terminate())
+
+    @staticmethod
+    def _binary():
+        """Path to gpupower, compiled from gpupower.c next to this file when missing or stale."""
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gpupower.c")
+        out = os.path.join(STATE_DIR, "gpupower")
+        if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(src):
+            os.makedirs(STATE_DIR, exist_ok=True)
+            subprocess.run(["clang", "-O2", "-o", out, src, "-framework", "CoreFoundation", "-lIOReport"],
+                           check=True, capture_output=True, timeout=120)
+        return out
+
+    def loop(self):
+        while True:
+            try:
+                self._proc = subprocess.Popen([self._binary(), str(self.interval)], stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE, text=True)
+                for line in self._proc.stdout:
+                    d = json.loads(line)
+                    with self.lock:
+                        self.latest = d
+                        self.error = None
+                        for k in POWER_KEYS:
+                            self._energy[k] += d[k + "_w"] * d["dt"]
+                self.error = (self._proc.stderr.read().strip() or "gpupower stopped")[:200]
+            except Exception as e:
+                self.error = str(e)[:200]
+            print(f"gpud: power readings unavailable: {self.error}", file=sys.stderr, flush=True)
+            with self.lock:
+                self.latest = None
+            time.sleep(30)
+
+    def take(self):
+        """(latest watts or None, joules per block since the last call)."""
+        with self.lock:
+            energy, self._energy = self._energy, dict.fromkeys(POWER_KEYS, 0.0)
+            return self.latest, energy
+
+
 def describe_server(args):
     """Short name for an LLM server process: "mlx_vlm.server", "ollama", "llama-server"."""
     tokens = args.split()
@@ -338,6 +410,16 @@ def describe_server(args):
         if not tok.startswith("-"):
             return os.path.basename(tok)
     return os.path.basename(tokens[0]) if tokens else "llm"
+
+
+def merge_series(tokens, power):
+    """One bucket per key from token rows (key, t, gen, prompt) and power rows {key: (t, gpu_j, ai_j)}."""
+    out = {k: {"key": k, "t": t, "generated": g, "prompt": p, "gpu_j": 0.0, "ai_j": 0.0} for k, t, g, p in tokens}
+    for k, (t, gj, aj) in power.items():
+        b = out.setdefault(k, {"key": k, "t": t, "generated": 0, "prompt": 0})
+        b["t"] = min(b["t"], t)
+        b["gpu_j"], b["ai_j"] = round(gj or 0, 1), round(aj or 0, 1)
+    return [out[k] for k in sorted(out)]
 
 
 class HistoryDB:
@@ -354,7 +436,10 @@ class HistoryDB:
         # v1.2: the process doing most of the work, so the timeline can show who was busy.
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(samples)")}
         for col, typ in (("top", "TEXT"), ("top_pct", "REAL"), ("top_ai", "INTEGER"),
-                         ("tok_gen", "INTEGER DEFAULT 0"), ("tok_prompt", "INTEGER DEFAULT 0")):
+                         ("tok_gen", "INTEGER DEFAULT 0"), ("tok_prompt", "INTEGER DEFAULT 0"),
+                         # v1.6: power (watts, for charts) and energy (joules, for exact sums)
+                         ("gpu_w", "REAL"), ("cpu_w", "REAL"), ("ane_w", "REAL"), ("dram_w", "REAL"),
+                         ("soc_w", "REAL"), ("ai_w", "REAL"), ("gpu_j", "REAL DEFAULT 0"), ("ai_j", "REAL DEFAULT 0")):
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE samples ADD COLUMN {col} {typ}")
         for t, procs in self.conn.execute("SELECT t, procs FROM samples WHERE top IS NULL").fetchall():
@@ -370,27 +455,50 @@ class HistoryDB:
             self.conn.execute("""INSERT INTO token_usage
                 SELECT CAST(t / 3600 AS INTEGER) * 3600, '', '', SUM(tok_gen), SUM(tok_prompt)
                 FROM samples GROUP BY 1 HAVING SUM(tok_gen) + SUM(tok_prompt) > 0""")
+        # energy_j: GPU+ANE joules spent producing these tokens; measured_gen: generated tokens it covers
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(token_usage)")}
+        for col, typ in (("energy_j", "REAL DEFAULT 0"), ("measured_gen", "INTEGER DEFAULT 0")):
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE token_usage ADD COLUMN {col} {typ}")
+        # v1.6: energy per hour, kept forever. ai_j is GPU+ANE energy used by local LLM servers.
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS power_hourly (
+            hour INTEGER PRIMARY KEY, gpu_j REAL, cpu_j REAL, ane_j REAL, dram_j REAL, other_j REAL,
+            ai_j REAL, seconds REAL)""")
         self.conn.commit()
         self._pending = 0
 
-    def add(self, snap, by_model=None):
+    def add(self, snap, by_model=None, energy=None, model_energy=None):
         keys = ("pid", "name", "gpu_percent", "is_ai", "activity", "command", "cwd", "tok_s")
         procs = [{k: p[k] for k in keys if k in p} for p in snap["processes"][:5]]
         with self.lock:
             top = top_process(procs) or ("", 0, 0)
             self.conn.execute(
                 """INSERT OR REPLACE INTO samples
-                   (t, util, mem_percent, mem_bytes, mood, ai, procs, top, top_pct, top_ai, tok_gen, tok_prompt)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (t, util, mem_percent, mem_bytes, mood, ai, procs, top, top_pct, top_ai, tok_gen, tok_prompt,
+                    gpu_w, cpu_w, ane_w, dram_w, soc_w, ai_w, gpu_j, ai_j)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (snap["timestamp"], snap["gpu"]["utilization_percent"], snap["memory"]["used_percent"],
                  snap["memory"]["used_bytes"], snap["gpu"]["mood"], int(snap["ai_active"]), json.dumps(procs), *top,
-                 snap["tokens"]["generated_delta"], snap["tokens"]["prompt_delta"]))
+                 snap["tokens"]["generated_delta"], snap["tokens"]["prompt_delta"],
+                 *(snap["power"].get(k) for k in ("gpu_w", "cpu_w", "ane_w", "dram_w", "soc_w", "ai_w")),
+                 (energy or {}).get("gpu", 0), (energy or {}).get("ai", 0)))
             hour = int(snap["timestamp"] // 3600) * 3600
-            for (server, model), (gen, prompt) in (by_model or {}).items():
+            for key, (gen, prompt) in (by_model or {}).items():
+                server, model = key
                 self.conn.execute(
-                    """INSERT INTO token_usage VALUES (?,?,?,?,?) ON CONFLICT (hour, server, model)
-                       DO UPDATE SET generated = generated + excluded.generated, prompt = prompt + excluded.prompt""",
-                    (hour, server or "", model or "", int(gen), int(prompt)))
+                    """INSERT INTO token_usage (hour, server, model, generated, prompt, energy_j, measured_gen)
+                       VALUES (?,?,?,?,?,?,?) ON CONFLICT (hour, server, model) DO UPDATE SET
+                       generated = generated + excluded.generated, prompt = prompt + excluded.prompt,
+                       energy_j = energy_j + excluded.energy_j, measured_gen = measured_gen + excluded.measured_gen""",
+                    (hour, server or "", model or "", int(gen), int(prompt), (model_energy or {}).get(key, 0.0),
+                     int(gen) if (model_energy or {}).get(key) else 0))
+            if energy:
+                self.conn.execute(
+                    """INSERT INTO power_hourly VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (hour) DO UPDATE SET
+                       gpu_j = gpu_j + excluded.gpu_j, cpu_j = cpu_j + excluded.cpu_j, ane_j = ane_j + excluded.ane_j,
+                       dram_j = dram_j + excluded.dram_j, other_j = other_j + excluded.other_j,
+                       ai_j = ai_j + excluded.ai_j, seconds = seconds + excluded.seconds""",
+                    (hour, *(energy.get(k, 0.0) for k in POWER_KEYS), energy.get("ai", 0.0), energy.get("seconds", 0.0)))
             self._pending += 1
             if self._pending >= 10:  # batch commits to keep disk writes low
                 self.conn.execute("DELETE FROM samples WHERE t < ?", (time.time() - RETENTION_SECONDS,))
@@ -404,7 +512,7 @@ class HistoryDB:
         with self.lock:
             rows = self.conn.execute(
                 """SELECT CAST((t - ?) / ? AS INTEGER) AS b, MIN(t), AVG(util), MAX(util), AVG(mem_percent), MAX(ai),
-                          SUM(tok_gen), SUM(tok_prompt)
+                          SUM(tok_gen), SUM(tok_prompt), AVG(gpu_w), AVG(soc_w)
                    FROM samples WHERE t >= ? GROUP BY b ORDER BY b""",
                 (start, bucket, start)).fetchall()
             # Per bucket, the process that did the most GPU work.
@@ -420,19 +528,23 @@ class HistoryDB:
                    WHERE t >= ? AND top != '' GROUP BY top ORDER BY SUM(top_pct) DESC LIMIT 6""",
                 (start,)).fetchall()
             first = self.conn.execute("SELECT MIN(t) FROM samples").fetchone()[0]
-            gen_total, prompt_total = self.conn.execute(
-                "SELECT COALESCE(SUM(tok_gen), 0), COALESCE(SUM(tok_prompt), 0) FROM samples WHERE t >= ?", (start,)).fetchone()
+            gen_total, prompt_total, gpu_j, ai_j, peak_w = self.conn.execute(
+                """SELECT COALESCE(SUM(tok_gen), 0), COALESCE(SUM(tok_prompt), 0), COALESCE(SUM(gpu_j), 0),
+                          COALESCE(SUM(ai_j), 0), MAX(gpu_w) FROM samples WHERE t >= ?""", (start,)).fetchone()
         samples = []
-        for b, _, u, mx, m, ai, tg, tp in rows:
+        for b, _, u, mx, m, ai, tg, tp, gw, sw in rows:
             top = tops.get(b)
             samples.append({"t": start + (b + 0.5) * bucket, "util": round(u, 1), "max": mx,
                             "mem": round(m, 1), "ai": bool(ai),
                             "top": top[0] if top else None, "top_pct": round(top[2], 1) if top else 0,
-                            "tok_gen": tg or 0, "tok_prompt": tp or 0})
+                            "tok_gen": tg or 0, "tok_prompt": tp or 0,
+                            "gpu_w": round(gw, 1) if gw is not None else None,
+                            "soc_w": round(sw, 1) if sw is not None else None})
         return {
             "start": start, "end": end, "bucket_seconds": bucket, "oldest": first,
             "samples": samples,
             "tokens": {"generated": gen_total, "prompt": prompt_total},
+            "energy": {"gpu_j": round(gpu_j, 1), "ai_j": round(ai_j, 1), "peak_gpu_w": peak_w},
             "legend": [{"label": lbl, "seconds": round(n * 1.0), "avg_pct": round(pct, 1), "is_ai": bool(ai), "last_t": last}
                        for lbl, n, pct, ai, last in legend],
         }
@@ -457,16 +569,45 @@ class HistoryDB:
                            SUM(generated), SUM(prompt)
                     FROM token_usage WHERE {where} GROUP BY k ORDER BY k""", (start, end)).fetchall()
             models = self.conn.execute(
-                f"""SELECT server, model, SUM(generated), SUM(prompt), MIN(hour), MAX(hour) FROM token_usage
-                    WHERE {where} GROUP BY server, model ORDER BY SUM(generated) + SUM(prompt) DESC""",
+                f"""SELECT server, model, SUM(generated), SUM(prompt), MIN(hour), MAX(hour), SUM(energy_j), SUM(measured_gen)
+                    FROM token_usage WHERE {where} GROUP BY server, model
+                    ORDER BY SUM(generated) + SUM(prompt) DESC""",
                 (start, end)).fetchall()
+            model_j = self.conn.execute(
+                f"SELECT COALESCE(SUM(energy_j), 0), COALESCE(SUM(measured_gen), 0) FROM token_usage WHERE {where}",
+                (start, end)).fetchone()
+            energy = self.conn.execute(
+                f"""SELECT COALESCE(SUM(gpu_j), 0), COALESCE(SUM(cpu_j), 0), COALESCE(SUM(ane_j), 0),
+                           COALESCE(SUM(dram_j), 0), COALESCE(SUM(other_j), 0), COALESCE(SUM(ai_j), 0),
+                           COALESCE(SUM(seconds), 0)
+                    FROM power_hourly WHERE {where}""", (start, end)).fetchone()
+            power_series = {k: (t, g, a) for k, t, g, a in self.conn.execute(
+                f"""SELECT strftime('{self.GROUPS[group]}', hour, 'unixepoch', 'localtime') AS k, MIN(hour),
+                           SUM(gpu_j), SUM(ai_j)
+                    FROM power_hourly WHERE {where} GROUP BY k""", (start, end))}
         return {
             "from": start, "to": end, "group": group, "first_recorded": first, "last_recorded": last,
             "generated": gen, "prompt": prompt, "total": gen + prompt, "active_hours": hours,
-            "series": [{"key": k, "t": t, "generated": g, "prompt": p} for k, t, g, p in series],
+            "series": merge_series(series, power_series),
             "models": [{"server": s or "before per-model tracking", "model": m or "Earlier tokens", "generated": g, "prompt": p,
-                        "first": f, "last": l} for s, m, g, p, f, l in models],
+                        "first": f, "last": l, "energy_j": round(j or 0, 1),
+                        "j_per_token": round(j / mg, 3) if mg else None} for s, m, g, p, f, l, j, mg in models],
+            # Joules: whole-chip blocks over the period, and the share used by LLM servers for tokens.
+            "energy": {"gpu_j": round(energy[0], 1), "cpu_j": round(energy[1], 1), "ane_j": round(energy[2], 1),
+                       "dram_j": round(energy[3], 1), "soc_j": round(sum(energy[:5]), 1),
+                       "ai_j": round(model_j[0], 1), "measured_seconds": round(energy[6]),
+                       # J per generated token, over the tokens whose energy was measured
+                       "j_per_token": round(model_j[0] / model_j[1], 3) if model_j[1] else None},
         }
+
+    def energy_totals(self, since):
+        """(GPU joules, joules matched to tokens, generated tokens those joules made) since a time."""
+        with self.lock:
+            gpu = self.conn.execute("SELECT COALESCE(SUM(gpu_j), 0) FROM samples WHERE t >= ?", (since,)).fetchone()[0]
+            ai, gen = self.conn.execute(
+                "SELECT COALESCE(SUM(energy_j), 0), COALESCE(SUM(measured_gen), 0) FROM token_usage WHERE hour >= ?",
+                (int(since // 3600) * 3600,)).fetchone()
+        return gpu, ai, gen
 
     def token_totals(self, since):
         with self.lock:
@@ -477,7 +618,8 @@ class HistoryDB:
         """The sample closest to t (within 5 minutes), or None."""
         with self.lock:
             row = self.conn.execute(
-                """SELECT t, util, mem_percent, mem_bytes, mood, ai, procs, tok_gen, tok_prompt FROM samples
+                """SELECT t, util, mem_percent, mem_bytes, mood, ai, procs, tok_gen, tok_prompt,
+                          gpu_w, cpu_w, ane_w, dram_w, soc_w, ai_w FROM samples
                    WHERE t BETWEEN ? AND ? ORDER BY ABS(t - ?) LIMIT 1""",
                 (t - 300, t + 300, t)).fetchone()
             if not row:
@@ -489,9 +631,11 @@ class HistoryDB:
             day_gen, day_prompt = self.conn.execute(
                 "SELECT COALESCE(SUM(tok_gen), 0), COALESCE(SUM(tok_prompt), 0) FROM samples WHERE t BETWEEN ? AND ?",
                 (row[0] - RETENTION_SECONDS, row[0])).fetchone()
-        t, util, mem_percent, mem_bytes, mood_, ai, procs, tok_gen, tok_prompt = row
+        t, util, mem_percent, mem_bytes, mood_, ai, procs, tok_gen, tok_prompt, *watts = row
+        power = dict(zip(("gpu_w", "cpu_w", "ane_w", "dram_w", "soc_w", "ai_w"), watts))
+        power["available"] = watts[0] is not None
         return {"t": t, "util": util, "mem_percent": mem_percent, "mem_bytes": mem_bytes,
-                "mood": mood_, "ai": bool(ai), "processes": json.loads(procs),
+                "mood": mood_, "ai": bool(ai), "processes": json.loads(procs), "power": power,
                 "tokens": {"generated_per_s": round(gen_min / 60, 1), "prompt_per_s": round(prompt_min / 60, 1),
                            "generated_delta": tok_gen or 0, "prompt_delta": tok_prompt or 0,
                            "generated_24h": day_gen, "prompt_24h": day_prompt,
@@ -499,10 +643,15 @@ class HistoryDB:
 
 
 class GPUSampler:
-    def __init__(self, interval, db, tokens):
+    def __init__(self, interval, db, tokens, power):
         self.interval = interval
         self.db = db
         self.tokens = tokens
+        self.power = power
+        self.gpu_peak_w = 0.0
+        self._ai_pool = 0.0  # LLM energy (J) not yet matched to the tokens it produced
+        self._ai_pool_t = time.time()
+        self._e24 = list(db.energy_totals(time.time() - RETENTION_SECONDS))
         self._tok24 = list(db.token_totals(time.time() - RETENTION_SECONDS))
         self._tok24_refreshed = time.time()
         self.lock = threading.Lock()
@@ -625,6 +774,7 @@ class GPUSampler:
         gen_d, prompt_d, sources, by_model = self.tokens.take()
         if now - self._tok24_refreshed > 30:  # re-sync the rolling 24h totals with the database
             self._tok24 = list(self.db.token_totals(now - RETENTION_SECONDS))
+            self._e24 = list(self.db.energy_totals(now - RETENTION_SECONDS))
             self._tok24_refreshed = now
         self._tok24[0] += gen_d
         self._tok24[1] += prompt_d
@@ -636,6 +786,54 @@ class GPUSampler:
         dt = (now - self._prev_ts) if self._prev_ts else 0.0
         self._prev_ts = now
         st = self._static
+
+        # Power. The share of GPU+ANE energy that goes to LLM servers: their part of the GPU time while
+        # they're working. Server counters often jump only when a request finishes, so that energy
+        # waits in a pool until tokens arrive and is then split across the models that produced them.
+        watts, energy = self.power.take()
+        llm_pids = {s["pid"] for s in sources if s["pid"]}
+        total_pct = sum(p["gpu_percent"] for p in active)
+        llm_pct = sum(p["gpu_percent"] for p in active if p["pid"] in llm_pids)
+        busy = gen_d or prompt_d or llm_pct >= 1 or any(s["in_flight"] for s in sources)
+        share = (llm_pct / total_pct if total_pct else 1.0) if busy else 0.0
+        ai_j = (energy["gpu"] + energy["ane"]) * share
+        energy["ai"] = ai_j
+        energy["seconds"] = dt if watts else 0.0
+        self._ai_pool += ai_j
+        if busy:
+            self._ai_pool_t = now
+        model_energy = {}
+        if by_model:
+            # Prefill is roughly an order of magnitude cheaper per token than decoding.
+            weights = {k: g + p / 10 for k, (g, p) in by_model.items()}
+            total_w = sum(weights.values()) or 1
+            model_energy = {k: self._ai_pool * w / total_w for k, w in weights.items()}
+            if self._ai_pool > 0:
+                self._e24[2] += sum(g for g, _ in by_model.values())
+            self._ai_pool = 0.0
+        elif now - self._ai_pool_t > 600:
+            self._ai_pool = 0.0  # nothing came of it; it still counts as GPU energy
+        self._e24[0] += energy["gpu"]
+        self._e24[1] += sum(model_energy.values())
+        power = {"available": watts is not None, "error": self.power.error}
+        if watts:
+            soc = sum(watts[k + "_w"] for k in POWER_KEYS)
+            ai_w = (watts["gpu_w"] + watts["ane_w"]) * share
+            self.gpu_peak_w = max(self.gpu_peak_w, watts["gpu_w"])
+            tok_s = max((s["tok_s"] for s in sources), default=0)
+            jpt = ai_w / tok_s if tok_s and ai_w else None
+            power.update({k + "_w": round(watts[k + "_w"], 2) for k in POWER_KEYS})
+            power.update({
+                "soc_w": round(soc, 2),
+                "ai_w": round(ai_w, 2),
+                "gpu_peak_w": round(self.gpu_peak_w, 1),
+                "j_per_token": round(jpt, 3) if jpt else None,       # right now, while decoding
+                "tokens_per_wh": round(3600 / jpt) if jpt else None,
+            })
+        power["gpu_wh_24h"] = round(self._e24[0] / 3600, 2)
+        power["ai_wh_24h"] = round(self._e24[1] / 3600, 2)
+        # Over the last 24h, for the generated tokens whose energy was measured (prompt processing included).
+        power["j_per_token_24h"] = round(self._e24[1] / self._e24[2], 3) if self._e24[2] else None
         self.ops_total += util / 100 * st["est_peak_tflops"] * 1e12 * dt
         self.peak_util = max(self.peak_util, util)
         if util >= 50:
@@ -674,6 +872,7 @@ class GPUSampler:
                 "in_flight": sum(s["in_flight"] or 0 for s in sources),
                 "sources": sources,
             },
+            "power": power,
             "fun": {
                 "est_peak_tflops": st["est_peak_tflops"],
                 "est_current_tflops": round(util / 100 * st["est_peak_tflops"], 2),
@@ -686,7 +885,7 @@ class GPUSampler:
         with self.cond:
             self.latest = snap
             self.cond.notify_all()
-        self.db.add(snap, by_model)
+        self.db.add(snap, by_model, energy if watts else None, model_energy)
 
     def replay_snapshot(self, row):
         st = self._static
@@ -706,6 +905,7 @@ class GPUSampler:
             "processes": row["processes"],
             "ai_active": row["ai"],
             "tokens": row["tokens"],
+            "power": row["power"],
             "fun": fun,
         }
 
@@ -751,9 +951,86 @@ def period(name, week_start=2):
     return start.timestamp(), time.time() + 3600
 
 
-def make_handler(sampler):
+def computer_name():
+    try:
+        return run(["scutil", "--get", "ComputerName"]).decode().strip() or socket.gethostname()
+    except Exception:
+        return socket.gethostname()
+
+
+def local_hostname():
+    """"Studio.local", the mDNS name other Macs can reach this one by."""
+    try:
+        return run(["scutil", "--get", "LocalHostName"]).decode().strip() + ".local"
+    except Exception:
+        return socket.gethostname()
+
+
+class Identity:
+    """This Mac's TLS certificate and the access token remote viewers must present.
+
+    Both are created on first run in STATE_DIR (private key and token readable only by you).
+    The pairing code is the token (16 chars) plus the first 12 chars of the certificate's
+    SHA-256 fingerprint, so a viewer can check it reached the right Mac before sending the token.
+    """
+
+    def __init__(self, state_dir=STATE_DIR):
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        self.cert = os.path.join(state_dir, "remote-cert.pem")
+        self.key = os.path.join(state_dir, "remote-key.pem")
+        self.token_file = os.path.join(state_dir, "remote-token")
+        if not (os.path.exists(self.cert) and os.path.exists(self.key)):
+            subprocess.run(["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:3072",  # macOS Python's LibreSSL can't serve EC certs
+                            "-nodes", "-days", "3650", "-subj", "/CN=GPU Buddy", "-keyout", self.key, "-out", self.cert],
+                           check=True, capture_output=True)
+            os.chmod(self.key, 0o600)
+        if not os.path.exists(self.token_file):
+            self.new_token()
+        with open(self.token_file) as f:
+            self.token = f.read().strip()
+        with open(self.cert) as f:
+            der = ssl.PEM_cert_to_DER_cert(f.read())
+        self.id = base64.b32encode(hashlib.sha256(der).digest()).decode()[:12]
+
+    def new_token(self):
+        """Replace the token; every paired viewer has to pair again."""
+        fd = os.open(self.token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(base64.b32encode(secrets.token_bytes(10)).decode())
+
+    @property
+    def pairing_code(self):
+        s = self.token + self.id
+        return "-".join(s[i:i + 4] for i in range(0, len(s), 4))
+
+    def tls_context(self):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(self.cert, self.key)
+        return ctx
+
+
+class DualStackServer(ThreadingHTTPServer):
+    """Listens on IPv6 and IPv4, so "Studio.local" works whichever address it resolves to."""
+    address_family = socket.AF_INET6
+    daemon_threads = True
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, ConnectionError, socket.timeout)):
+            return  # plain-HTTP probes, port scans, viewers that went away
+        super().handle_error(request, client_address)
+
+
+def make_handler(sampler, identity=None, remote=False):
+    """remote=True: the TLS listener for other Macs, where every request needs the token."""
     class Handler(BaseHTTPRequestHandler):
         server_version = f"gpud/{VERSION}"
+        protocol_version = "HTTP/1.1"  # keep-alive, so viewers polling every second reuse one TLS session
+        timeout = 120
 
         def log_message(self, *args):
             pass
@@ -763,7 +1040,8 @@ def make_handler(sampler):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
+            if not remote:
+                self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -772,8 +1050,23 @@ def make_handler(sampler):
 
         def do_GET(self):
             url = urlparse(self.path)
+            if remote:
+                sent = self.headers.get("Authorization", "").encode()
+                if not hmac.compare_digest(sent, ("Bearer " + identity.token).encode()):
+                    return self._json({"error": "pairing code required"}, 401)
             if url.path == "/health":
-                return self._json({"ok": True, "version": VERSION})
+                return self._json({"ok": True, "version": VERSION, "id": identity.id if identity else None,
+                                   "name": computer_name(), "model": sampler._static["model"]})
+            if url.path == "/api/v1/pairing" and not remote:
+                # Only for apps on this Mac: no CORS header, and refuse anything not addressed to
+                # loopback so a web page can't read it through DNS rebinding.
+                if self.headers.get("Host", "").split(":")[0] not in ("127.0.0.1", "localhost", "[::1]"):
+                    return self._json({"error": "forbidden"}, 403)
+                if identity is None:
+                    return self._json({"remote": False})
+                return self._json({"remote": True, "code": identity.pairing_code, "id": identity.id,
+                                   "name": computer_name(), "host": local_hostname(),
+                                   "port": sampler.remote_port})
             if url.path == "/api/v1/status":
                 with sampler.lock:
                     snap = sampler.latest
@@ -806,6 +1099,10 @@ def make_handler(sampler):
                 with sampler.lock:
                     snap = sampler.latest
                 return self._json(snap["tokens"] if snap else {})
+            if url.path == "/api/v1/power":
+                with sampler.lock:
+                    snap = sampler.latest
+                return self._json(snap["power"] if snap else {})
             if url.path == "/api/v1/usage":
                 try:
                     if "preset" in q:
@@ -824,7 +1121,8 @@ def make_handler(sampler):
                 out = {}
                 for name in ("today", "week", "month", "ytd", "total"):
                     u = sampler.db.usage(*period(name, ws), group="year")
-                    out[name] = {"generated": u["generated"], "prompt": u["prompt"], "total": u["total"]}
+                    out[name] = {"generated": u["generated"], "prompt": u["prompt"], "total": u["total"],
+                                 "gpu_j": u["energy"]["gpu_j"], "ai_j": u["energy"]["ai_j"]}
                 out["first_recorded"] = u["first_recorded"]
                 return self._json(out)
             if url.path == "/api/v1/stream":
@@ -835,8 +1133,11 @@ def make_handler(sampler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Connection", "close")
+            if not remote:
+                self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
+            self.close_connection = True
             last = None
             try:
                 while True:
@@ -855,19 +1156,63 @@ def make_handler(sampler):
     return Handler
 
 
+def advertise(identity, port, model):
+    """Announce this Mac over Bonjour so viewers on the network can find it."""
+    txt = {"id": identity.id, "host": local_hostname(), "port": port, "model": model, "ver": VERSION}
+    proc = subprocess.Popen(["dns-sd", "-R", computer_name(), BONJOUR_TYPE, "local", str(port)]
+                            + [f"{k}={v}" for k, v in txt.items()],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(proc.terminate)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # runs atexit, so the ad goes away with us
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=int(os.environ.get("GPUD_PORT", 8765)))
     ap.add_argument("--interval", type=float, default=1.0, help="seconds between samples")
     ap.add_argument("--db", default=os.environ.get("GPUD_DB", DEFAULT_DB), help="SQLite history file")
+    ap.add_argument("--remote-port", type=int, default=int(os.environ.get("GPUD_REMOTE_PORT", 8766)),
+                    help="TLS port for GPU Buddy on other Macs (0 turns remote viewing off)")
+    ap.add_argument("--pairing-code", action="store_true", help="print this Mac's pairing code and exit")
+    ap.add_argument("--new-pairing-code", action="store_true",
+                    help="make a new pairing code (unpairs every other Mac), print it and exit")
     args = ap.parse_args()
+
+    if args.pairing_code or args.new_pairing_code:
+        identity = Identity()
+        if args.new_pairing_code:
+            identity.new_token()
+            identity = Identity()
+            print("New code. Restart gpud to apply: launchctl kickstart -k gui/$(id -u)/local.gpubuddy.gpud", file=sys.stderr)
+        print(identity.pairing_code)
+        return
 
     tokens = TokenWatcher(args.interval)
     threading.Thread(target=tokens.loop, daemon=True).start()
-    sampler = GPUSampler(args.interval, HistoryDB(args.db), tokens)
+    power = PowerWatcher(args.interval)
+    threading.Thread(target=power.loop, daemon=True).start()
+    sampler = GPUSampler(args.interval, HistoryDB(args.db), tokens, power)
+    sampler.remote_port = args.remote_port
     threading.Thread(target=sampler.loop, daemon=True).start()
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(sampler))
+
+    identity = None
+    if args.remote_port:
+        try:
+            identity = Identity()
+            rserver = DualStackServer(("::", args.remote_port), make_handler(sampler, identity, remote=True))
+            # The handshake runs in the request thread, so a slow client can't stall accept().
+            rserver.socket = identity.tls_context().wrap_socket(rserver.socket, server_side=True,
+                                                                do_handshake_on_connect=False)
+            threading.Thread(target=rserver.serve_forever, daemon=True).start()
+            advertise(identity, args.remote_port, sampler._static["model"])
+            print(f"gpud: remote viewing on https://{local_hostname()}:{args.remote_port} "
+                  f"(pairing code: python3 gpud.py --pairing-code)", flush=True)
+        except Exception as e:
+            identity = None
+            print(f"gpud: remote viewing off: {e}", file=sys.stderr, flush=True)
+
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(sampler, identity))
     server.daemon_threads = True
     print(f"gpud {VERSION}: {sampler._static['model']} ({sampler._static['cores']} cores) "
           f"on http://{args.host}:{args.port}", flush=True)

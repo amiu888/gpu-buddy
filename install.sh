@@ -29,4 +29,7 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "gpud installed: http://127.0.0.1:$PORT/api/v1/status (logs: ~/Library/Logs/gpud.log)"
 
 "$ROOT/app/build.sh"
+sleep 2
+echo "Pairing code for watching this Mac from another one (GPU Buddy → Macs):"
+/usr/bin/python3 "$ROOT/daemon/gpud.py" --pairing-code || true
 echo "Open it with:  open \"$ROOT/app/GPU Buddy.app\""

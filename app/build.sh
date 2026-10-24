@@ -19,6 +19,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
+  <key>NSLocalNetworkUsageDescription</key><string>GPU Buddy finds and shows the GPUs of other Macs on your network.</string>
+  <key>NSBonjourServices</key><array><string>_gpubuddy._tcp</string></array>
 </dict></plist>
 PLIST
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true

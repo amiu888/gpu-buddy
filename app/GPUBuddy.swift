@@ -3,6 +3,8 @@
 
 import AppKit
 import Charts
+import CryptoKit
+import Network
 import SwiftUI
 
 // MARK: - API model
@@ -67,8 +69,26 @@ struct Snapshot: Decodable {
         let speed_tok_s: Double
         let sources: [Source]
     }
+    struct Power: Decodable {
+        let available: Bool
+        let error: String?
+        let gpu_w: Double?
+        let cpu_w: Double?
+        let ane_w: Double?
+        let dram_w: Double?
+        let other_w: Double?
+        let soc_w: Double?
+        let ai_w: Double?
+        let gpu_peak_w: Double?
+        let j_per_token: Double?
+        let tokens_per_wh: Double?
+        let gpu_wh_24h: Double?
+        let ai_wh_24h: Double?
+        let j_per_token_24h: Double?
+    }
     let fun: Fun
     let tokens: Tokens?
+    let power: Power?
 }
 
 struct Timeline: Decodable {
@@ -81,6 +101,12 @@ struct Timeline: Decodable {
         let top: String?
         let tok_gen: Double?
         let tok_prompt: Double?
+        let gpu_w: Double?
+    }
+    struct Energy: Decodable {
+        let gpu_j: Double
+        let ai_j: Double
+        let peak_gpu_w: Double?
     }
     struct LegendItem: Decodable {
         let label: String
@@ -93,6 +119,7 @@ struct Timeline: Decodable {
     let samples: [Point]
     let legend: [LegendItem]?
     let tokens: TokenTotals?
+    let energy: Energy?
 
     struct TokenTotals: Decodable {
         let generated: Double
@@ -100,20 +127,120 @@ struct Timeline: Decodable {
     }
 }
 
+// MARK: - Connections (this Mac over loopback, other Macs over TLS)
+
+/// RFC 4648 base32, the alphabet gpud uses for its id and pairing codes.
+func base32(_ data: Data) -> String {
+    let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+    var out = "", buffer = 0, bits = 0
+    for byte in data {
+        buffer = (buffer << 8) | Int(byte)
+        bits += 8
+        while bits >= 5 {
+            out.append(alphabet[(buffer >> (bits - 5)) & 31])
+            bits -= 5
+        }
+        buffer &= (1 << bits) - 1
+    }
+    if bits > 0 { out.append(alphabet[(buffer << (5 - bits)) & 31]) }
+    return out
+}
+
+/// A Mac running gpud. "local" is this Mac; the others were paired with a pairing code.
+struct HostRecord: Codable, Identifiable, Equatable {
+    var id: String       // gpud's id (its certificate fingerprint prefix), or "local"
+    var name: String
+    var address: String  // "Studio.local:8766"
+    var token: String = ""
+    var isLocal: Bool { id == "local" }
+    var title: String { isLocal ? "This Mac" : name }
+}
+
+struct Health: Decodable {
+    let ok: Bool
+    let id: String?
+    let name: String?
+    let model: String?
+}
+
+struct Pairing: Decodable {
+    let remote: Bool
+    let code: String?
+    let id: String?
+    let name: String?
+    let host: String?
+    let port: Int?
+}
+
+/// Talks to one gpud. For other Macs every request goes over TLS, the server's certificate must
+/// match the fingerprint from the pairing code (so nobody can pretend to be that Mac), and the
+/// pairing token rides along in the Authorization header.
+final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
+    let base: String
+    private let token: String?
+    private let pin: String?
+    private let lock = NSLock()
+    private var _problem: String?
+    private var pinFailed = false
+    private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
+
+    /// Why the last request failed, in words.
+    var problem: String? { lock.withLock { _problem } }
+
+    init(host: HostRecord, localPort: Int) {
+        if host.isLocal {
+            base = "http://127.0.0.1:\(localPort)"  // loopback never leaves this Mac
+            token = nil
+            pin = nil
+        } else {
+            base = "https://\(host.address)"
+            token = host.token
+            pin = host.id
+        }
+    }
+
+    func get<T: Decodable>(_ path: String, timeout: Double = 2) async -> T? {
+        var req = URLRequest(url: URL(string: base + path)!)
+        req.timeoutInterval = timeout
+        if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        do {
+            let (data, resp) = try await session.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            lock.withLock { _problem = code == 200 ? nil : code == 401 ? "pairing code not accepted" : "error \(code)" }
+            return code == 200 ? try? JSONDecoder().decode(T.self, from: data) : nil
+        } catch {
+            if Task.isCancelled { return nil }
+            lock.withLock {
+                _problem = pinFailed ? "its certificate doesn't match the pairing code" : pin == nil ? "gpud isn't running" : "offline"
+            }
+            return nil
+        }
+    }
+
+    func close() { session.invalidateAndCancel() }
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge) async
+        -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust else { return (.performDefaultHandling, nil) }
+        guard let pin, let leaf = (SecTrustCopyCertificateChain(trust) as? [SecCertificate])?.first,
+              base32(Data(SHA256.hash(data: SecCertificateCopyData(leaf) as Data))).hasPrefix(pin) else {
+            lock.withLock { pinFailed = true }
+            return (.cancelAuthenticationChallenge, nil)
+        }
+        lock.withLock { pinFailed = false }
+        return (.useCredential, URLCredential(trust: trust))
+    }
+}
+
+/// Live state of one Mac.
 @MainActor
 final class GPUStore: ObservableObject {
     @Published var snap: Snapshot?
     @Published var online = false
+    @Published private(set) var problem: String?
     @Published var history: [Double] = []
     @Published var visible = true
-    @Published var compact = UserDefaults.standard.bool(forKey: "compact") {
-        didSet {
-            UserDefaults.standard.set(compact, forKey: "compact")
-            if compact { scrub(to: nil) }
-            onCompactChange?(compact)
-        }
-    }
-    var onCompactChange: ((Bool) -> Void)?
     @Published var timeline: Timeline?
     @Published var range: Double = 3600 {
         didSet { Task { await fetchTimeline() } }
@@ -122,15 +249,18 @@ final class GPUStore: ObservableObject {
     @Published private(set) var scrubTime: Double?
     @Published private(set) var replay: Snapshot?
     var onUpdate: ((GPUStore) -> Void)?
-    var onOpenLedger: (() -> Void)?
+    /// The one on screen; only it fetches the timeline.
+    var active = false
 
-    private let base: String
+    let host: HostRecord
+    let client: APIClient
     private var timer: Timer?
     private var ticks = 0
     private var replayTask: Task<Void, Never>?
 
-    init(port: Int) {
-        base = "http://127.0.0.1:\(port)"
+    init(host: HostRecord, localPort: Int) {
+        self.host = host
+        client = APIClient(host: host, localPort: localPort)
     }
 
     /// What the UI shows: the live snapshot, or the replayed one while scrubbing.
@@ -148,32 +278,31 @@ final class GPUStore: ObservableObject {
         }
         replayTask = Task {
             try? await Task.sleep(nanoseconds: 25_000_000)  // coalesce drag events
-            guard !Task.isCancelled, let s: Snapshot = await get("/api/v1/at?t=\(t)"), !Task.isCancelled else { return }
+            guard !Task.isCancelled, let s: Snapshot = await client.get("/api/v1/at?t=\(t)"), !Task.isCancelled else { return }
             replay = s
         }
     }
 
     func fetchTimeline() async {
-        if let tl: Timeline = await get("/api/v1/history?seconds=\(Int(range))&points=300") { timeline = tl }
-    }
-
-    private func get<T: Decodable>(_ path: String) async -> T? {
-        var req = URLRequest(url: URL(string: base + path)!)
-        req.timeoutInterval = 2
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-        return try? JSONDecoder().decode(T.self, from: data)
+        if let tl: Timeline = await client.get("/api/v1/history?seconds=\(Int(range))&points=300") { timeline = tl }
     }
 
     func start() {
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.poll() }
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
+            guard let self else { return t.invalidate() }
+            Task { @MainActor in await self.poll() }
         }
         Task { await poll() }
     }
 
+    func stop() {
+        timer?.invalidate()
+        replayTask?.cancel()
+        client.close()
+    }
+
     private func poll() async {
-        if let s: Snapshot = await get("/api/v1/status") {
+        if let s: Snapshot = await client.get("/api/v1/status") {
             snap = s
             online = true
             history.append(Double(s.gpu.utilization_percent))
@@ -181,9 +310,177 @@ final class GPUStore: ObservableObject {
         } else {
             online = false
         }
-        if online && (timeline == nil || ticks % 10 == 0) { await fetchTimeline() }
+        problem = online ? nil : client.problem
+        if online && active && (timeline == nil || ticks % 10 == 0) { await fetchTimeline() }
         ticks += 1
         onUpdate?(self)
+    }
+}
+
+/// Every Mac the window can show: this one, plus the ones paired over the network.
+/// Finds gpud's on the local network over Bonjour (_gpubuddy._tcp).
+@MainActor
+final class Fleet: ObservableObject {
+    struct Found: Identifiable, Equatable {
+        let id: String
+        let name: String
+        let address: String
+        let model: String
+    }
+
+    @Published private(set) var stores: [GPUStore] = []
+    @Published private(set) var current: GPUStore
+    /// gpud's seen on the network right now (not counting this Mac).
+    @Published private(set) var found: [Found] = []
+    /// This Mac's own pairing code, for sharing with other Macs.
+    @Published private(set) var thisMac: Pairing?
+    @Published var compact = UserDefaults.standard.bool(forKey: "compact") {
+        didSet {
+            UserDefaults.standard.set(compact, forKey: "compact")
+            if compact { current.scrub(to: nil) }
+            onCompactChange?()
+        }
+    }
+    var onCompactChange: (() -> Void)?
+    var onSelect: (() -> Void)?
+    var onUpdate: ((GPUStore) -> Void)?
+    var onOpenLedger: (() -> Void)?
+    var onOpenMacs: (() -> Void)?
+
+    let localPort: Int
+    private var browser: NWBrowser?
+    private var seen: [Found] = []
+    /// Paired Macs, including their tokens: readable only by you.
+    private let file = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/GPUBuddy/viewer-hosts.json")
+
+    init(localPort: Int) {
+        self.localPort = localPort
+        var records = [HostRecord(id: "local", name: "This Mac", address: "127.0.0.1:\(localPort)")]
+        if let data = try? Data(contentsOf: file), let saved = try? JSONDecoder().decode([HostRecord].self, from: data) {
+            records += saved.filter { !$0.isLocal }
+        }
+        let all = records.map { GPUStore(host: $0, localPort: localPort) }
+        stores = all
+        current = all.first { $0.host.id == UserDefaults.standard.string(forKey: "selectedHost") } ?? all[0]
+        current.active = true
+        all.forEach(wire)
+    }
+
+    private func wire(_ s: GPUStore) {
+        s.onUpdate = { [weak self] s in
+            guard let self, s === self.current else { return }
+            self.onUpdate?(s)
+        }
+    }
+
+    func start() {
+        stores.forEach { $0.start() }
+        browse()
+        Task {
+            thisMac = await stores[0].client.get("/api/v1/pairing")
+            update(found: seen)
+        }
+    }
+
+    func select(_ s: GPUStore) {
+        guard s !== current else { return }
+        current.scrub(to: nil)
+        current.active = false
+        current = s
+        s.active = true
+        UserDefaults.standard.set(s.host.id, forKey: "selectedHost")
+        Task { await s.fetchTimeline() }
+        onSelect?()
+        onUpdate?(s)
+    }
+
+    func step(_ n: Int) {
+        guard let i = stores.firstIndex(where: { $0 === current }) else { return }
+        select(stores[(i + n + stores.count) % stores.count])
+    }
+
+    func isPaired(_ id: String) -> Bool { stores.contains { $0.host.id == id } }
+
+    /// Checks the code against the Mac at address and, if it answers, adds it. Returns an error message.
+    func pair(address: String, code: String) async -> String? {
+        let clean = code.uppercased().filter { $0.isLetter || $0.isNumber }
+        guard clean.count == 28 else { return "A pairing code has 28 letters and digits (7 groups of 4)." }
+        var addr = address.trimmingCharacters(in: .whitespaces)
+        if addr.isEmpty { return "Enter the Mac's address, like Studio.local" }
+        if !addr.contains(":") || addr.hasSuffix("]") { addr += ":8766" }
+        var rec = HostRecord(id: String(clean.suffix(12)), name: addr, address: addr, token: String(clean.prefix(16)))
+        if rec.id == thisMac?.id { return "That's this Mac's own code. Enter the code shown on the other Mac." }
+        let client = APIClient(host: rec, localPort: localPort)
+        let health: Health? = await client.get("/health", timeout: 6)
+        client.close()
+        guard let health, health.ok else {
+            return "Couldn't connect: \(client.problem ?? "no answer")."
+        }
+        rec.name = health.name ?? addr
+        if stores.contains(where: { $0.host.id == rec.id }) { remove(rec.id) }
+        let s = GPUStore(host: rec, localPort: localPort)
+        wire(s)
+        stores.append(s)
+        s.start()
+        save()
+        select(s)
+        return nil
+    }
+
+    func remove(_ id: String) {
+        guard id != "local", let s = stores.first(where: { $0.host.id == id }) else { return }
+        if s === current { select(stores[0]) }
+        s.stop()
+        stores.removeAll { $0 === s }
+        save()
+    }
+
+    private func save() {
+        let remote = stores.map(\.host).filter { !$0.isLocal }
+        guard let data = try? JSONEncoder().encode(remote) else { return }
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: file.path, contents: data, attributes: [.posixPermissions: 0o600])
+    }
+
+    private func browse() {
+        let b = NWBrowser(for: .bonjourWithTXTRecord(type: "_gpubuddy._tcp", domain: nil), using: .tcp)
+        b.browseResultsChangedHandler = { [weak self] results, _ in
+            let list = results.compactMap { r -> Found? in
+                guard case .service(let name, _, _, _) = r.endpoint, case .bonjour(let txt) = r.metadata else { return nil }
+                let d = txt.dictionary
+                guard let id = d["id"], let host = d["host"] else { return nil }
+                return Found(id: id, name: name, address: "\(host):\(d["port"] ?? "8766")", model: d["model"] ?? "")
+            }
+            MainActor.assumeIsolated { self?.update(found: list) }
+        }
+        b.start(queue: .main)
+        browser = b
+    }
+
+    private func update(found list: [Found]) {
+        seen = list
+        var ids = Set<String>()
+        found = list.filter { $0.id != thisMac?.id && ids.insert($0.id).inserted }.sorted { $0.name < $1.name }
+        // A paired Mac that now answers at a different address (renamed, new network): follow it.
+        for f in found {
+            guard let i = stores.firstIndex(where: { $0.host.id == f.id }), stores[i].host.address != f.address else { continue }
+            let old = stores[i]
+            var rec = old.host
+            rec.address = f.address
+            rec.name = f.name
+            let n = GPUStore(host: rec, localPort: localPort)
+            wire(n)
+            old.stop()
+            stores[i] = n
+            n.start()
+            if old === current {
+                current = n
+                n.active = true
+                onSelect?()
+            }
+            save()
+        }
     }
 }
 
@@ -668,6 +965,67 @@ struct TokenCard: View {
     }
 }
 
+/// Live chip power and how much energy each token takes.
+struct PowerCard: View {
+    let power: Snapshot.Power?
+
+    private let orange = Color(red: 1, green: 0.62, blue: 0.35)
+
+    var body: some View {
+        HStack(spacing: 6) {
+            stat("⚡ GPU", power?.gpu_w.map { String(format: $0 < 10 ? "%.1f W" : "%.0f W", $0) },
+                 power?.gpu_peak_w.map { "peak \(Int($0)) W" })
+            stat("🔌 CHIP", power?.soc_w.map { String(format: "%.0f W", $0) }, power?.cpu_w.map { "CPU \(Int($0)) W" })
+            stat("🍃 PER TOKEN", perToken, perTokenSub)
+        }
+        .help(breakdown)
+    }
+
+    private var perToken: String? {
+        if let j = power?.j_per_token { return String(format: "%.2f J", j) }
+        if let j = power?.j_per_token_24h { return String(format: "%.2f J", j) }
+        return power?.available == true ? "–" : nil
+    }
+
+    private var perTokenSub: String? {
+        if let n = power?.tokens_per_wh { return "\(shortCount(n)) tok/Wh" }
+        return power?.j_per_token_24h != nil ? "24h avg" : power?.available == true ? "no tokens" : nil
+    }
+
+    private func stat(_ title: String, _ value: String?, _ sub: String?) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title).font(.system(size: 8, weight: .black, design: .rounded)).foregroundColor(.white.opacity(0.6))
+                .lineLimit(1).fixedSize()
+            Text(value ?? "--").font(.system(size: 14, weight: .heavy, design: .rounded)).monospacedDigit()
+                .foregroundColor(value == nil ? .white.opacity(0.5) : orange).lineLimit(1).minimumScaleFactor(0.7)
+            Text(sub ?? " ").font(.system(size: 8, weight: .semibold, design: .rounded)).monospacedDigit()
+                .foregroundColor(.white.opacity(0.5)).lineLimit(1).minimumScaleFactor(0.7)
+        }
+        .padding(.horizontal, 7).padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.06)))
+    }
+
+    private var breakdown: String {
+        guard let p = power, p.available else {
+            return "Power readings aren't available\(power?.error.map { ": \($0)" } ?? ".")"
+        }
+        let w = { (v: Double?) in String(format: "%.1f W", v ?? 0) }
+        var lines = ["GPU \(w(p.gpu_w)) · CPU \(w(p.cpu_w)) · Neural Engine \(w(p.ane_w))",
+                     "Memory \(w(p.dram_w)) · rest of the chip \(w(p.other_w)) · total \(w(p.soc_w))"]
+        if let ai = p.ai_w, ai > 0 { lines.append("Local LLM servers are using \(w(ai)) of GPU power") }
+        if let j = p.j_per_token { lines.append(String(format: "Right now: %.2f J per generated token", j)) }
+        if let g = p.gpu_wh_24h {
+            var l = String(format: "Last 24h: GPU used %.2f Wh", g)
+            if let a = p.ai_wh_24h, a > 0 { l += String(format: ", %.2f Wh of it making tokens", a) }
+            lines.append(l)
+        }
+        if let j = p.j_per_token_24h { lines.append(String(format: "24h average: %.2f J per generated token (prompt reading included)", j)) }
+        lines.append("Measured from the chip's own energy counters. The whole Mac at the wall uses more.")
+        return lines.joined(separator: "\n")
+    }
+}
+
 struct ProcessRow: View {
     let p: Snapshot.Proc
 
@@ -805,6 +1163,7 @@ struct TimelineBar: View {
                     Text("\(pt?.ai == true ? "🤖 " : "")\(top)").lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 2)
                     if let g = pt?.tok_gen, g > 0 { Text("✍️\(shortCount(g))").foregroundColor(Color(red: 1, green: 0.85, blue: 0.5)) }
+                    if let w = pt?.gpu_w { Text("⚡\(Int(w))W").foregroundColor(Color(red: 1, green: 0.62, blue: 0.35)) }
                     Text("\(Int(pt?.util ?? 0))%").monospacedDigit()
                 } else {
                     Text(pt == nil ? "no data" : "idle 😴").foregroundColor(.white.opacity(0.5))
@@ -814,8 +1173,12 @@ struct TimelineBar: View {
                 Text("-\(ranges.first { $0.0 == store.range }?.1 ?? "")")
                 Spacer()
                 if let tk = store.timeline?.tokens, tk.generated + tk.prompt > 0 {
-                    Text("✍️ \(shortCount(tk.generated)) gen · 📖 \(shortCount(tk.prompt)) used")
+                    Text("✍️ \(shortCount(tk.generated)) · 📖 \(shortCount(tk.prompt))"
+                         + (store.timeline?.energy.map { $0.gpu_j > 0 ? " · ⚡ \(energyText($0.gpu_j))" : "" } ?? ""))
                         .foregroundColor(Color(red: 1, green: 0.85, blue: 0.5))
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                } else if let e = store.timeline?.energy, e.gpu_j > 0 {
+                    Text("⚡ GPU used \(energyText(e.gpu_j))").foregroundColor(Color(red: 1, green: 0.62, blue: 0.35))
                 } else {
                     Text("hover to peek · drag to rewind")
                 }
@@ -888,6 +1251,17 @@ struct TimelineBar: View {
                 i == 0 ? mem.move(to: mp) : mem.addLine(to: mp)
             }
             ctx.stroke(mem, with: .color(Color(red: 0.45, green: 0.65, blue: 1).opacity(0.8)), lineWidth: 1)
+            // GPU watts, scaled to the busiest moment in range.
+            let peakW = max(tl.samples.compactMap(\.gpu_w).max() ?? 0, 1)
+            var watts = Path()
+            var started = false
+            for pt in tl.samples {
+                guard let gw = pt.gpu_w else { started = false; continue }
+                let wp = CGPoint(x: x(pt.t), y: h * (1 - gw / peakW * 0.95))
+                started ? watts.addLine(to: wp) : watts.move(to: wp)
+                started = true
+            }
+            ctx.stroke(watts, with: .color(Color(red: 1, green: 0.62, blue: 0.35).opacity(0.9)), lineWidth: 1)
             // Golden sparkle along the top wherever tokens were generated.
             let maxTok = tl.samples.compactMap(\.tok_gen).max() ?? 0
             if maxTok > 0 {
@@ -932,6 +1306,24 @@ func clockText(_ t: Double) -> String {
     return f.string(from: Date(timeIntervalSince1970: t))
 }
 
+/// Joules as something readable: "350 J", "0.26 Wh", "42 Wh", "1.20 kWh".
+func energyText(_ joules: Double) -> String {
+    let wh = joules / 3600
+    if wh >= 1000 { return String(format: "%.2f kWh", wh / 1000) }
+    if wh >= 10 { return String(format: "%.0f Wh", wh) }
+    if wh >= 0.1 { return String(format: "%.2f Wh", wh) }
+    return String(format: "%.0f J", joules)
+}
+
+/// What these tokens would cost on the Claude API at list prices ($ per 1M input, output), no caching.
+let cloudPrices: [(name: String, input: Double, output: Double)] = [
+    ("Opus 5.5", 4, 20), ("Sonnet 5.5", 2, 10), ("Haiku 5.5", 0.10, 0.50),
+]
+
+func moneyText(_ v: Double) -> String {
+    v >= 100 ? String(format: "$%.0f", v) : v >= 1 ? String(format: "$%.2f", v) : v >= 0.01 ? String(format: "$%.2f", v) : v > 0 ? "<$0.01" : "$0"
+}
+
 /// 1234 -> "1.2K", 3_400_000 -> "3.4M"
 func shortCount(_ v: Double) -> String {
     for (scale, suffix) in [(1e9, "B"), (1e6, "M"), (1e3, "K")] where v >= scale {
@@ -950,7 +1342,8 @@ func bigNumber(_ v: Double) -> String {
 
 @MainActor func hype(_ store: GPUStore, tick: Int) -> String {
     guard store.online, let s = store.shown else {
-        return "I can't reach gpud. Run ./install.sh to wake me up 🔌"
+        if store.host.isLocal { return "I can't reach gpud. Run ./install.sh to wake me up 🔌" }
+        return "Can't reach \(store.host.name): \(store.problem ?? "offline") 🔌"
     }
     let top = s.processes.first?.label ?? "something"
     if let t = store.scrubTime {
@@ -960,6 +1353,9 @@ func bigNumber(_ v: Double) -> String {
     }
     let cores = s.gpu.cores
     let ops = bigNumber(s.fun.est_ops_since_start)
+    if let p = s.power, let n = p.tokens_per_wh, tick % 4 == 3 {
+        return "🍃 \(shortCount(n)) tokens per watt-hour, on \(Int(p.gpu_w ?? 0)) W!"
+    }
     if let tk = s.tokens, tk.speed_tok_s > 0, tick % 2 == 0 {
         return "⚡ Writing \(Int(tk.speed_tok_s)) tokens/sec for you!"
     }
@@ -1000,8 +1396,16 @@ func bigNumber(_ v: Double) -> String {
 let moodLabel = ["sleeping": "NAPPING", "chill": "CHILLING", "working": "WORKING",
                  "hustling": "HUSTLING", "turbo": "TURBO!", "offline": "OFFLINE"]
 
+struct RootView: View {
+    @ObservedObject var fleet: Fleet
+    let anim: Anim
+
+    var body: some View { ContentView(store: fleet.current, fleet: fleet, anim: anim) }
+}
+
 struct ContentView: View {
     @ObservedObject var store: GPUStore
+    @ObservedObject var fleet: Fleet
     var anim = Anim()
 
     var body: some View {
@@ -1010,7 +1414,7 @@ struct ContentView: View {
             let _ = anim.step(tl.date, util: store.util, mem: store.online ? (s?.memory.used_percent ?? 0) / 100 : 0,
                               ai: s?.ai_active ?? false, tokS: store.online ? (s?.tokens?.speed_tok_s ?? 0) : 0)
             Group {
-                if store.compact { compact(s) } else { full(s) }
+                if fleet.compact { compact(s) } else { full(s) }
             }
         }
         .foregroundColor(.white)
@@ -1026,14 +1430,14 @@ struct ContentView: View {
     private var moodColor: Color { Color(hue: anim.hue, saturation: 0.45, brightness: 1) }
 
     private func modeButton(_ symbol: String) -> some View {
-        Button { store.compact.toggle() } label: {
+        Button { fleet.compact.toggle() } label: {
             Image(systemName: symbol)
                 .font(.system(size: 9, weight: .bold))
                 .frame(width: 18, height: 18)
                 .background(Circle().fill(.white.opacity(0.16)))
         }
         .buttonStyle(.plain)
-        .help(store.compact ? "Full view (⌘1)" : "Compact view (⌘1)")
+        .help(fleet.compact ? "Full view (⌘1)" : "Compact view (⌘1)")
     }
 
     // Full window: Chippy, stats, processes, hype and the 24h timeline.
@@ -1046,6 +1450,8 @@ struct ContentView: View {
                 .overlay(alignment: .topTrailing) { modeButton("rectangle.compress.vertical").padding(8) }
 
             VStack(spacing: 8) {
+                HostBar(fleet: fleet)
+
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(store.online ? "\(s?.gpu.utilization_percent ?? 0)%" : "--")
                         .font(.system(size: 34, weight: .heavy, design: .rounded))
@@ -1076,7 +1482,8 @@ struct ContentView: View {
                     MemoryTank(anim: anim).frame(height: 13)
                 }
 
-                TokenCard(tokens: store.online ? s?.tokens : nil, time: anim.time) { store.onOpenLedger?() }
+                TokenCard(tokens: store.online ? s?.tokens : nil, time: anim.time) { fleet.onOpenLedger?() }
+                PowerCard(power: store.online ? s?.power : nil)
 
                 VStack(spacing: 4) {
                     ForEach(topProcesses(s, 3)) { ProcessRow(p: $0) }
@@ -1118,15 +1525,17 @@ struct ContentView: View {
                     modeButton("rectangle.expand.vertical")
                 }
                 MemoryTank(anim: anim).frame(height: 7)
-                Text("mem " + memText(s))
+                Text((fleet.stores.count > 1 ? "\(store.host.title) · " : "") + "mem " + memText(s)
+                     + (store.online ? s?.power?.gpu_w.map { " · ⚡\(Int($0)) W" } ?? "" : ""))
                     .font(.system(size: 9, weight: .semibold, design: .rounded)).monospacedDigit()
                     .foregroundColor(.white.opacity(0.6))
+                    .lineLimit(1).minimumScaleFactor(0.75)
                 if let tk = store.online ? s?.tokens : nil {
                     Text("✍️\(shortCount(tk.generated_24h)) 📖\(shortCount(tk.prompt_24h))\(tk.speed_tok_s > 0 ? " ⚡\(Int(tk.speed_tok_s))/s" : " tokens")")
                         .font(.system(size: 9, weight: .semibold, design: .rounded)).monospacedDigit()
                         .foregroundColor(Color(red: 1, green: 0.85, blue: 0.5))
                         .lineLimit(1)
-                        .onTapGesture { store.onOpenLedger?() }
+                        .onTapGesture { fleet.onOpenLedger?() }
                         .help("Click for the Token Ledger (⌘L)")
                 }
                 Text(topProcesses(s, 1).first.map { "\($0.is_ai ? "🤖 " : "")\($0.label)" } ?? (store.online ? "😴 nothing running" : "gpud offline"))
@@ -1175,6 +1584,230 @@ struct DockIcon: View {
     }
 }
 
+// MARK: - Macs (switch between this Mac and others on the network)
+
+/// One chip per Mac with its live %, plus a ＋ to pair more.
+struct HostBar: View {
+    @ObservedObject var fleet: Fleet
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(fleet.stores, id: \.host.id) { s in
+                        HostChip(store: s, selected: s === fleet.current) { fleet.select(s) }
+                    }
+                }
+            }
+            Button { fleet.onOpenMacs?() } label: {
+                Text(fleet.stores.count > 1 ? "＋" : "＋ Macs")
+                    .font(.system(size: 9.5, weight: .heavy, design: .rounded))
+                    .padding(.horizontal, 7).frame(height: 20)
+                    .background(Capsule().fill(.white.opacity(0.1)))
+            }
+            .buttonStyle(.plain)
+            .help("Watch other Macs (⌘K)")
+        }
+    }
+}
+
+struct HostChip: View {
+    @ObservedObject var store: GPUStore
+    let selected: Bool
+    let action: () -> Void
+
+    private let gold = Color(red: 1, green: 0.85, blue: 0.5)
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Circle().fill(store.online ? Color.green : Color.red.opacity(0.7)).frame(width: 6, height: 6)
+                Text(store.host.title).lineLimit(1).frame(maxWidth: 90)
+                if store.online {
+                    Text("\(store.snap?.gpu.utilization_percent ?? 0)%").monospacedDigit().opacity(0.75)
+                }
+            }
+            .font(.system(size: 9.5, weight: .heavy, design: .rounded))
+            .padding(.horizontal, 7).frame(height: 20)
+            .background(Capsule().fill(selected ? gold.opacity(0.3) : .white.opacity(0.07)))
+            .overlay(Capsule().stroke(selected ? gold.opacity(0.8) : .clear, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(store.host.isLocal ? "This Mac" : "\(store.host.name) · \(store.host.address)\(store.problem.map { "\n\($0)" } ?? "")")
+    }
+}
+
+/// Pair with GPU Buddy on other Macs, and share this Mac's pairing code.
+struct MacsView: View {
+    @ObservedObject var fleet: Fleet
+    @State private var pairing: String?  // Found.id being paired
+    @State private var code = ""
+    @State private var address = ""
+    @State private var manualCode = ""
+    @State private var error: String?
+    @State private var busy = false
+    @State private var copied = false
+
+    private let gold = Color(red: 1, green: 0.85, blue: 0.5)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("🖥 Macs").font(.system(size: 17, weight: .heavy, design: .rounded))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 22)
+                .background(WindowDragArea())
+
+            section("WATCHING") {
+                ForEach(fleet.stores, id: \.host.id) { s in PairedRow(store: s, fleet: fleet) }
+            }
+
+            section("ON YOUR NETWORK") {
+                if fleet.found.isEmpty {
+                    note("Looking for Macs running gpud… Install it on the other Mac with ./install.sh.")
+                }
+                ForEach(fleet.found) { f in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(f.name).font(.system(size: 12, weight: .bold, design: .rounded))
+                                Text("\(f.model.replacingOccurrences(of: "Apple ", with: "")) · \(f.address)")
+                                    .font(.system(size: 9.5, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.5))
+                            }
+                            Spacer()
+                            if fleet.isPaired(f.id) {
+                                Text("✓ paired").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(.green)
+                            } else if pairing != f.id {
+                                pill("Pair…") {
+                                    pairing = f.id
+                                    code = ""
+                                    error = nil
+                                }
+                            }
+                        }
+                        if pairing == f.id {
+                            HStack(spacing: 6) {
+                                TextField("Pairing code from that Mac", text: $code)
+                                    .textFieldStyle(.roundedBorder).font(.system(size: 11, design: .monospaced))
+                                    .onSubmit { connect(f.address, code) }
+                                pill(busy ? "…" : "Connect") { connect(f.address, code) }
+                            }
+                        }
+                    }
+                }
+            }
+
+            section("ADD BY ADDRESS") {
+                HStack(spacing: 6) {
+                    TextField("Studio.local or 192.168.1.20", text: $address).textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11)).frame(width: 150)
+                    TextField("Pairing code", text: $manualCode).textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11, design: .monospaced))
+                        .onSubmit { connect(address, manualCode) }
+                    pill(busy ? "…" : "Add") { connect(address, manualCode) }
+                }
+            }
+
+            if let error {
+                Text("⚠️ " + error).font(.system(size: 10.5, weight: .semibold, design: .rounded)).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            section("SHARE THIS MAC") {
+                if let p = fleet.thisMac, p.remote, let c = p.code {
+                    HStack {
+                        Text(c).font(.system(size: 12, weight: .bold, design: .monospaced)).foregroundColor(gold)
+                            .textSelection(.enabled)
+                        Spacer()
+                        pill(copied ? "Copied" : "Copy") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(c, forType: .string)
+                            copied = true
+                        }
+                    }
+                    note("On another Mac, open GPU Buddy → Macs (⌘K) and enter this code to watch \(p.name ?? "this Mac") (\(p.host ?? "")). Everything is encrypted with TLS, and the code also proves it's really this Mac. Keep it private: anyone with it can see this Mac's GPU activity.")
+                } else if fleet.thisMac != nil {
+                    note("Remote viewing is off on this Mac (gpud was started with --remote-port 0).")
+                } else {
+                    note("gpud isn't running on this Mac, so it can't be watched from elsewhere. You can still watch other Macs.")
+                }
+            }
+        }
+        .padding(.horizontal, 16).padding(.bottom, 16)
+        .frame(width: 400, alignment: .topLeading)
+        .foregroundColor(.white)
+        .background(Color(red: 0.1, green: 0.09, blue: 0.15))
+        .ignoresSafeArea()
+    }
+
+    private func connect(_ address: String, _ code: String) {
+        guard !busy else { return }
+        busy = true
+        error = nil
+        Task {
+            let e = await fleet.pair(address: address, code: code)
+            busy = false
+            error = e
+            if e == nil {
+                pairing = nil
+                self.code = ""
+                manualCode = ""
+            }
+        }
+    }
+
+    private func section<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.system(size: 9.5, weight: .black, design: .rounded)).foregroundColor(.white.opacity(0.6))
+            content()
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(.white.opacity(0.05)))
+    }
+
+    private func note(_ text: String) -> some View {
+        Text(text).font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.55))
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func pill(_ title: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title).font(.system(size: 10.5, weight: .heavy, design: .rounded))
+                .padding(.horizontal, 10).frame(height: 22)
+                .background(Capsule().fill(gold)).foregroundColor(.black)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct PairedRow: View {
+    @ObservedObject var store: GPUStore
+    @ObservedObject var fleet: Fleet
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(store.online ? Color.green : Color.red.opacity(0.7)).frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(store.host.title).font(.system(size: 12, weight: .bold, design: .rounded))
+                Text(store.online
+                     ? "\(store.snap?.gpu.utilization_percent ?? 0)% GPU · " + (store.host.isLocal ? "local" : "\(store.host.address) · 🔒 TLS")
+                     : (store.problem ?? "connecting…"))
+                    .font(.system(size: 9.5, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.5))
+                    .lineLimit(1)
+            }
+            Spacer()
+            if store !== fleet.current {
+                Button("Show") { fleet.select(store) }.buttonStyle(.plain)
+                    .font(.system(size: 10.5, weight: .heavy, design: .rounded)).foregroundColor(Color(red: 1, green: 0.85, blue: 0.5))
+            }
+            if !store.host.isLocal {
+                Button { fleet.remove(store.host.id) } label: { Image(systemName: "trash").font(.system(size: 10)) }
+                    .buttonStyle(.plain).foregroundColor(.white.opacity(0.5)).help("Forget this Mac")
+            }
+        }
+    }
+}
+
 // MARK: - Token Ledger (all-time token usage with period filters)
 
 struct Usage: Decodable {
@@ -1183,6 +1816,8 @@ struct Usage: Decodable {
         let t: Double
         let generated: Double
         let prompt: Double
+        let gpu_j: Double?
+        let ai_j: Double?
         var id: String { key }
         var date: Date { Date(timeIntervalSince1970: t) }
     }
@@ -1191,7 +1826,16 @@ struct Usage: Decodable {
         let model: String
         let generated: Double
         let prompt: Double
+        let energy_j: Double?
+        let j_per_token: Double?
         var id: String { server + "|" + model }
+    }
+    struct Energy: Decodable {
+        let gpu_j: Double
+        let soc_j: Double
+        let ai_j: Double
+        let measured_seconds: Double
+        let j_per_token: Double?
     }
     let from: Double
     let to: Double
@@ -1202,6 +1846,7 @@ struct Usage: Decodable {
     let total: Double
     let series: [Bucket]
     let models: [Model]
+    let energy: Energy?
 }
 
 struct UsageSummary: Decodable {
@@ -1250,16 +1895,19 @@ final class Ledger: ObservableObject {
     @Published private(set) var summary: UsageSummary?
     @Published private(set) var online = true
 
-    private let base: String
+    let hostName: String
+    private let client: APIClient
     private let cal = Calendar.current
     private var timer: Timer?
     private var task: Task<Void, Never>?
 
-    init(port: Int) {
-        base = "http://127.0.0.1:\(port)"
+    init(client: APIClient, hostName: String) {
+        self.client = client
+        self.hostName = hostName
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] t in
+            guard let self else { return t.invalidate() }
+            Task { @MainActor in self.refresh() }
         }
     }
 
@@ -1320,22 +1968,14 @@ final class Ledger: ObservableObject {
         if let group { path += "&group=\(group)" }
         task?.cancel()
         task = Task { [path] in
-            async let u: Usage? = get(path)
-            async let s: UsageSummary? = get("/api/v1/usage/summary?week_start=\(cal.firstWeekday)")
+            async let u: Usage? = client.get(path, timeout: 3)
+            async let s: UsageSummary? = client.get("/api/v1/usage/summary?week_start=\(cal.firstWeekday)", timeout: 3)
             let (usage, summary) = await (u, s)
             guard !Task.isCancelled else { return }
             online = usage != nil
             if let usage { self.usage = usage }
             if let summary { self.summary = summary }
         }
-    }
-
-    private func get<T: Decodable>(_ path: String) async -> T? {
-        var req = URLRequest(url: URL(string: base + path)!)
-        req.timeoutInterval = 3
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-        return try? JSONDecoder().decode(T.self, from: data)
     }
 }
 
@@ -1359,6 +1999,8 @@ struct LedgerView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 Text("📒 Token Ledger").font(.system(size: 17, weight: .heavy, design: .rounded))
+                Text(ledger.hostName).font(.system(size: 11, weight: .bold, design: .rounded)).foregroundColor(.white.opacity(0.5))
+                    .lineLimit(1)
                 Spacer()
                 Text(ledger.online ? "" : "gpud offline").font(.system(size: 10, weight: .bold, design: .rounded))
                     .foregroundColor(.orange)
@@ -1373,6 +2015,7 @@ struct LedgerView: View {
                 .font(.system(size: 11, weight: .bold, design: .rounded)).foregroundColor(.white.opacity(0.6))
 
             totals
+            energy
             chart
             models
         }
@@ -1473,6 +2116,57 @@ struct LedgerView: View {
         .textSelection(.enabled)
     }
 
+    private let orange = Color(red: 1, green: 0.62, blue: 0.35)
+    @AppStorage("kwhPrice") private var kwhPrice = 0.15
+
+    // Energy for the period and what it cost, next to what the same tokens cost in the cloud.
+    private var energy: some View {
+        let u = ledger.usage
+        let e = u?.energy
+        let measured = (e?.measured_seconds ?? 0) > 0
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                tile("⚡ GPU ENERGY", measured ? e.map { energyText($0.gpu_j) } : nil,
+                     measured ? "whole chip \(energyText(e?.soc_j ?? 0))" : "no power data yet", orange)
+                tile("🤖 FOR TOKENS", measured ? e.map { energyText($0.ai_j) } : nil,
+                     e?.j_per_token.map { String(format: "%.2f J / token", $0) } ?? " ", orange)
+                tile("💡 ELECTRICITY", measured ? e.map { moneyText($0.soc_j / 3.6e6 * kwhPrice) } : nil,
+                     "chip, at $\(String(format: "%.2f", kwhPrice))/kWh", orange)
+            }
+            if let u, u.total > 0 {
+                let cloud = cloudPrices.map { "\($0.name) \(moneyText(u.prompt / 1e6 * $0.input + u.generated / 1e6 * $0.output))" }
+                Text("☁️ On the Claude API these tokens would cost " + cloud.joined(separator: " · "))
+                    .font(.system(size: 10, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help("List prices per million tokens (input / output): "
+                          + cloudPrices.map { "\($0.name) $\(String(format: "%g", $0.input)) / $\(String(format: "%g", $0.output))" }.joined(separator: ", ")
+                          + ". Prompt caching and the Batch API would lower these. Haiku's price is for prompts under 100K tokens.")
+            }
+            HStack(spacing: 4) {
+                Text("Electricity price $").font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.5))
+                TextField("", value: $kwhPrice, format: .number.precision(.fractionLength(2)))
+                    .textFieldStyle(.plain).font(.system(size: 9.5, weight: .bold, design: .rounded)).frame(width: 34)
+                    .padding(.horizontal, 3).background(RoundedRectangle(cornerRadius: 4).fill(.white.opacity(0.08)))
+                Text("per kWh · the whole Mac at the wall uses more than the chip")
+                    .font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.5))
+                    .lineLimit(1).minimumScaleFactor(0.8)
+            }
+        }
+    }
+
+    private func tile(_ title: String, _ value: String?, _ sub: String, _ color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.system(size: 8.5, weight: .black, design: .rounded)).foregroundColor(.white.opacity(0.6))
+            Text(value ?? "--").font(.system(size: 17, weight: .heavy, design: .rounded)).monospacedDigit()
+                .foregroundColor(value == nil ? .white.opacity(0.5) : color).lineLimit(1).minimumScaleFactor(0.6)
+            Text(sub).font(.system(size: 8.5, weight: .semibold, design: .rounded)).monospacedDigit()
+                .foregroundColor(.white.opacity(0.5)).lineLimit(1).minimumScaleFactor(0.7)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.07)))
+    }
+
     private var unit: Calendar.Component {
         switch ledger.usage?.group {
         case "hour": return .hour
@@ -1509,16 +2203,18 @@ struct LedgerView: View {
         }()
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(hover.map { "\(label($0)) · ✍️ \(shortCount($0.generated)) · 📖 \(shortCount($0.prompt))" }
+                Text(hover.map { b in show == "Energy"
+                        ? "\(label(b)) · ⚡ \(energyText(b.gpu_j ?? 0)) · 🤖 \(energyText(b.ai_j ?? 0))"
+                        : "\(label(b)) · ✍️ \(shortCount(b.generated)) · 📖 \(shortCount(b.prompt))" }
                      ?? "Hover a bar for details")
                     .font(.system(size: 10, weight: .bold, design: .rounded)).monospacedDigit()
                     .foregroundColor(hover == nil ? .white.opacity(0.45) : .white)
                     .lineLimit(1)
                 Spacer()
                 Picker("", selection: $show) {
-                    Text("Both").tag("Both"); Text("✍️").tag("Gen"); Text("📖").tag("Used")
+                    Text("Both").tag("Both"); Text("✍️").tag("Gen"); Text("📖").tag("Used"); Text("⚡").tag("Energy")
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 120)
+                .pickerStyle(.segmented).labelsHidden().frame(width: 150)
             }
             if series.isEmpty {
                 RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.05))
@@ -1528,11 +2224,16 @@ struct LedgerView: View {
             } else {
                 Chart {
                     ForEach(series) { b in
-                        if show != "Used" {
+                        if show == "Energy" {
+                            BarMark(x: .value("Time", b.date, unit: unit), y: .value("Wh", (b.ai_j ?? 0) / 3600))
+                                .foregroundStyle(by: .value("Kind", "For tokens"))
+                            BarMark(x: .value("Time", b.date, unit: unit), y: .value("Wh", max(0, (b.gpu_j ?? 0) - (b.ai_j ?? 0)) / 3600))
+                                .foregroundStyle(by: .value("Kind", "Other GPU"))
+                        } else if show != "Used" {
                             BarMark(x: .value("Time", b.date, unit: unit), y: .value("Tokens", b.generated))
                                 .foregroundStyle(by: .value("Kind", "Generated"))
                         }
-                        if show != "Gen" {
+                        if show != "Gen" && show != "Energy" {
                             BarMark(x: .value("Time", b.date, unit: unit), y: .value("Tokens", b.prompt))
                                 .foregroundStyle(by: .value("Kind", "Used"))
                         }
@@ -1541,14 +2242,18 @@ struct LedgerView: View {
                         RuleMark(x: .value("Time", hover.date, unit: unit)).foregroundStyle(.white.opacity(0.25))
                     }
                 }
-                .chartForegroundStyleScale(["Generated": gold, "Used": lilac])
+                .chartForegroundStyleScale(["Generated": gold, "Used": lilac, "For tokens": orange,
+                                            "Other GPU": orange.opacity(0.35)])
                 .chartLegend(.hidden)
                 .chartXScale(domain: (cal.dateInterval(of: unit, for: lo)?.start ?? lo) ... max(hi, lo.addingTimeInterval(1)))
                 .chartPlotStyle { $0.clipped() }
                 .chartYAxis {
                     AxisMarks(position: .leading) { v in
                         AxisGridLine().foregroundStyle(.white.opacity(0.08))
-                        AxisValueLabel { Text(shortCount(v.as(Double.self) ?? 0)) }
+                        AxisValueLabel {
+                            let n = v.as(Double.self) ?? 0
+                            Text(show == "Energy" ? String(format: n < 10 ? "%.1f Wh" : "%.0f Wh", n) : shortCount(n))
+                        }
                     }
                 }
                 .chartXAxis {
@@ -1593,7 +2298,8 @@ struct LedgerView: View {
                             Text(m.server).font(.system(size: 9, weight: .medium, design: .rounded))
                                 .foregroundColor(.white.opacity(0.5)).lineLimit(1)
                             Spacer(minLength: 4)
-                            Text("✍️\(shortCount(m.generated))  📖\(shortCount(m.prompt))")
+                            Text("✍️\(shortCount(m.generated))  📖\(shortCount(m.prompt))"
+                                 + (m.j_per_token.map { String(format: "  🍃%.2f J/tok", $0) } ?? ""))
                                 .font(.system(size: 10, weight: .heavy, design: .rounded)).monospacedDigit().fixedSize()
                         }
                         GeometryReader { g in
@@ -1623,17 +2329,20 @@ struct LedgerView: View {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
-    var store: GPUStore!
+    var fleet: Fleet!
     var ledgerWindow: NSWindow?
+    var macsWindow: NSWindow?
     private var port = 8765
     private var lastIcon = -2
 
     func applicationDidFinishLaunching(_ note: Notification) {
         port = Int(ProcessInfo.processInfo.environment["GPUD_PORT"] ?? "") ?? 8765
-        store = GPUStore(port: port)
-        store.onUpdate = { [weak self] s in self?.updateDockIcon(s) }
-        store.onOpenLedger = { [weak self] in self?.openLedger() }
-        store.onCompactChange = { [weak self] _ in
+        fleet = Fleet(localPort: port)
+        fleet.onUpdate = { [weak self] s in self?.updateDockIcon(s) }
+        fleet.onOpenLedger = { [weak self] in self?.openLedger() }
+        fleet.onOpenMacs = { [weak self] in self?.openMacs() }
+        fleet.onSelect = { [weak self] in self?.hostChanged() }
+        fleet.onCompactChange = { [weak self] in
             DispatchQueue.main.async { self?.fitWindow(animate: true) }
         }
 
@@ -1646,7 +2355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.isMovableByWindowBackground = false  // drag via Chippy's scene; lets the timeline scrub
         window.backgroundColor = NSColor(red: 0.1, green: 0.09, blue: 0.15, alpha: 1)
         window.appearance = NSAppearance(named: .darkAqua)
-        window.contentView = NSHostingView(rootView: ContentView(store: store))
+        window.contentView = NSHostingView(rootView: RootView(fleet: fleet, anim: Anim()))
         window.delegate = self
         window.setFrameAutosaveName("GPUBuddyWindow")
         let restored = window.setFrameUsingName("GPUBuddyWindow")
@@ -1657,13 +2366,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.store.visible = self.window.occlusionState.contains(.visible)
+                let visible = self.window.occlusionState.contains(.visible)
+                self.fleet.stores.forEach { $0.visible = visible }
             }
         }
 
         NSApp.mainMenu = makeMenu()
         NSApp.activate(ignoringOtherApps: true)
-        store.start()
+        fleet.start()
     }
 
     private func makeMenu() -> NSMenu {
@@ -1680,6 +2390,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let ledger = NSMenuItem(title: "Token Ledger…", action: #selector(openLedger), keyEquivalent: "l")
         ledger.target = self
         appMenu.addItem(ledger)
+        appMenu.addItem(.separator())
+        for (title, action, key) in [("Macs…", #selector(openMacs), "k"), ("Next Mac", #selector(nextMac), "]"),
+                                     ("Previous Mac", #selector(previousMac), "[")] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.target = self
+            appMenu.addItem(item)
+        }
         appMenu.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "Quit GPU Buddy", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -1698,7 +2415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             w.isReleasedWhenClosed = false
             w.backgroundColor = window.backgroundColor
             w.appearance = NSAppearance(named: .darkAqua)
-            w.contentView = NSHostingView(rootView: LedgerView(ledger: Ledger(port: self.port)))
+            w.contentView = ledgerContent()
             w.setFrameAutosaveName("GPUBuddyLedger")
             if !w.setFrameUsingName("GPUBuddyLedger") {
                 w.setFrameTopLeftPoint(NSPoint(x: window.frame.maxX + 12, y: window.frame.maxY))
@@ -1709,8 +2426,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func toggleCompact() {
-        store.compact.toggle()
+        fleet.compact.toggle()
     }
+
+    private func ledgerContent() -> NSView {
+        let ledger = Ledger(client: fleet.current.client, hostName: fleet.current.host.title)
+        return NSHostingView(rootView: LedgerView(ledger: ledger))
+    }
+
+    /// Another Mac was picked: the ledger and Dock icon follow it.
+    private func hostChanged() {
+        lastIcon = -2
+        if let w = ledgerWindow { w.contentView = ledgerContent() }
+    }
+
+    @objc func openMacs() {
+        if macsWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 520),
+                             styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+            w.titlebarAppearsTransparent = true
+            w.titleVisibility = .hidden
+            w.title = "Macs"
+            w.isReleasedWhenClosed = false
+            w.backgroundColor = window.backgroundColor
+            w.appearance = NSAppearance(named: .darkAqua)
+            let host = NSHostingView(rootView: MacsView(fleet: fleet))
+            host.sizingOptions = [.preferredContentSize]
+            w.contentView = host
+            w.center()
+            macsWindow = w
+        }
+        macsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func nextMac() { fleet.step(1) }
+    @objc func previousMac() { fleet.step(-1) }
 
     /// Resize to the SwiftUI content, keeping the window's top edge in place.
     private func fitWindow(animate: Bool) {
@@ -1720,7 +2470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.setFrame(frame, display: true, animate: animate)
         // The traffic lights would sit on top of mini Chippy; ⌘M still minimizes.
         for b in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-            window.standardWindowButton(b)?.isHidden = store.compact
+            window.standardWindowButton(b)?.isHidden = fleet.compact
         }
     }
 
