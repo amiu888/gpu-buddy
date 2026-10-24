@@ -1,13 +1,63 @@
 // GPU Buddy — a tiny, animated window that shows what your GPU is doing.
-// Talks to the gpud daemon (http://127.0.0.1:8765). Build with ./build.sh.
+// Talks to the gpud daemon (http://127.0.0.1:8765, or other Macs over TLS).
+// This file is shared by the macOS app (mac/main.swift, ./build.sh) and the iOS app (ios/, ./build-ios.sh).
 
-import AppKit
 import Charts
+import CoreImage
 import CryptoKit
+import ImageIO
 import Network
 import SwiftUI
 import UniformTypeIdentifiers
 import Vision
+#if os(macOS)
+import AppKit
+typealias PlatformImage = NSImage
+#else
+import UIKit
+typealias PlatformImage = UIImage
+#endif
+
+extension Image {
+    init(platformImage: PlatformImage) {
+        #if os(macOS)
+        self.init(nsImage: platformImage)
+        #else
+        self.init(uiImage: platformImage)
+        #endif
+    }
+}
+
+/// Room for the Mac's traffic lights, drawn over the content of GPU Buddy's borderless windows.
+#if os(macOS)
+let titleBarInset = 22.0
+#else
+let titleBarInset = 8.0
+#endif
+
+func copyToClipboard(_ text: String) {
+    #if os(macOS)
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+    #else
+    UIPasteboard.general.string = text
+    #endif
+}
+
+/// ~/Library/Application Support/GPUBuddy on the Mac; the app's own container on iOS.
+let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    .appendingPathComponent("GPUBuddy")
+
+extension View {
+    /// A fixed width on the Mac (small windows); the full screen width on iPhone and iPad.
+    @ViewBuilder func panelWidth(_ width: CGFloat) -> some View {
+        #if os(macOS)
+        frame(width: width)
+        #else
+        frame(maxWidth: .infinity)
+        #endif
+    }
+}
 
 // MARK: - API model
 
@@ -423,8 +473,7 @@ final class Fleet: ObservableObject {
     private var browser: NWBrowser?
     private var seen: [Found] = []
     /// Paired Macs, including their tokens: readable only by you.
-    private let file = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/GPUBuddy/viewer-hosts.json")
+    private let file = appSupport.appendingPathComponent("viewer-hosts.json")
 
     init(localPort: Int) {
         self.localPort = localPort
@@ -434,7 +483,10 @@ final class Fleet: ObservableObject {
         }
         let all = records.map { GPUStore(host: $0, localPort: localPort) }
         stores = all
-        current = all.first { $0.host.id == UserDefaults.standard.string(forKey: "selectedHost") } ?? all[0]
+        let saved = all.first { $0.host.id == UserDefaults.standard.string(forKey: "selectedHost") }
+        // On iOS the local entry is only a placeholder, so start on a paired Mac when there is one.
+        current = saved.flatMap { Self.hasLocal || !$0.host.isLocal ? $0 : nil }
+            ?? (Self.hasLocal ? all[0] : all.first { !$0.host.isLocal } ?? all[0])
         current.active = true
         all.forEach(wire)
     }
@@ -447,11 +499,23 @@ final class Fleet: ObservableObject {
         }
     }
 
+    /// iPhones and iPads can't run gpud, so there "local" is only a placeholder until a Mac is paired.
+    static var hasLocal: Bool {
+        #if os(macOS)
+        true
+        #else
+        false
+        #endif
+    }
+
+    /// The Macs to show: on iOS, the local placeholder is left out.
+    var watched: [GPUStore] { Self.hasLocal ? stores : stores.filter { !$0.host.isLocal } }
+
     func start() {
-        stores.forEach { $0.start() }
+        stores.filter { Self.hasLocal || !$0.host.isLocal }.forEach { $0.start() }
         browse()
         Task {
-            thisMac = await stores[0].client.get("/api/v1/pairing")
+            if Self.hasLocal { thisMac = await stores[0].client.get("/api/v1/pairing") }
             update(found: seen)
         }
     }
@@ -469,8 +533,10 @@ final class Fleet: ObservableObject {
     }
 
     func step(_ n: Int) {
-        guard let i = stores.firstIndex(where: { $0 === current }) else { return }
-        select(stores[(i + n + stores.count) % stores.count])
+        let list = watched
+        guard !list.isEmpty else { return }
+        let i = list.firstIndex(where: { $0 === current }) ?? 0
+        select(list[(i + n + list.count) % list.count])
     }
 
     func isPaired(_ id: String) -> Bool { stores.contains { $0.host.id == id } }
@@ -503,7 +569,7 @@ final class Fleet: ObservableObject {
 
     func remove(_ id: String) {
         guard id != "local", let s = stores.first(where: { $0.host.id == id }) else { return }
-        if s === current { select(stores[0]) }
+        if s === current { select(watched.first { $0 !== s } ?? stores[0]) }
         s.stop()
         stores.removeAll { $0 === s }
         save()
@@ -627,7 +693,7 @@ final class Anim {
 enum CharacterKind {
     case chippy
     case bunny
-    case photo(NSImage)
+    case photo(PlatformImage)
 }
 
 /// The characters to choose from: the built-in ones plus photo characters, which are cut out of
@@ -646,15 +712,16 @@ final class Characters: ObservableObject {
     }
     @Published private(set) var photos: [Entry] = []
     @Published private(set) var busy = false
-    private var images: [String: NSImage] = [:]
-    private let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/GPUBuddy/characters")
+    /// iOS: show the photo picker (the Mac uses an open panel instead).
+    @Published var pickingPhoto = false
+    private var images: [String: PlatformImage] = [:]
+    private let dir = appSupport.appendingPathComponent("characters")
     private var index: URL { dir.appendingPathComponent("index.json") }
 
     init() {
         if let data = try? Data(contentsOf: index), let list = try? JSONDecoder().decode([Entry].self, from: data) {
             for e in list {
-                if let img = NSImage(contentsOf: dir.appendingPathComponent("\(e.id).png")) {
+                if let img = PlatformImage(contentsOfFile: dir.appendingPathComponent("\(e.id).png").path) {
                     images[e.id] = img
                     photos.append(e)
                 }
@@ -689,7 +756,7 @@ final class Characters: ObservableObject {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let id = "photo-" + UUID().uuidString.prefix(8).lowercased()
         try png.write(to: dir.appendingPathComponent("\(id).png"))
-        guard let img = NSImage(data: png) else { return }
+        guard let img = PlatformImage(data: png) else { return }
         images[id] = img
         photos.append(Entry(id: id, name: name))
         saveIndex()
@@ -705,7 +772,18 @@ final class Characters: ObservableObject {
         if selected == id { selected = "chippy" }
     }
 
+    /// iOS: a photo from the picker.
+    func add(imageData: Data, name: String) async throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try imageData.write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try await add(from: tmp, name: name)
+    }
+
     func addFromPanel() {
+        #if os(iOS)
+        pickingPhoto = true
+        #else
         let panel = NSOpenPanel()
         panel.message = "Pick a photo of a toy, pet or anything with a clear subject. GPU Buddy cuts it out and animates it."
         panel.allowedContentTypes = [.image]
@@ -721,6 +799,7 @@ final class Characters: ObservableObject {
                 alert.runModal()
             }
         }
+        #endif
     }
 
     private func saveIndex() {
@@ -746,8 +825,12 @@ final class Characters: ObservableObject {
         // Keep it light: the scene draws it at most ~100pt tall.
         let scale = min(1, 600 / ci.extent.height)
         let small = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        guard let out = CIContext().createCGImage(small, from: small.extent),
-              let png = NSBitmapImageRep(cgImage: out).representation(using: .png, properties: [:]) else {
+        #if os(macOS)
+        let encode = { (cg: CGImage) in NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) }
+        #else
+        let encode = { (cg: CGImage) in UIImage(cgImage: cg).pngData() }
+        #endif
+        guard let out = CIContext().createCGImage(small, from: small.extent), let png = encode(out) else {
             throw fail("Couldn't save the cut-out.")
         }
         return png
@@ -1121,7 +1204,7 @@ struct SceneCanvas: View {
 
     // MARK: Photo characters: your cut-out, squashing, stretching and hopping.
 
-    private func drawPhoto(_ ctx: GraphicsContext, _ image: NSImage, cx: Double, groundY: Double, sleeping: Bool, offline: Bool) -> CGRect {
+    private func drawPhoto(_ ctx: GraphicsContext, _ image: PlatformImage, cx: Double, groundY: Double, sleeping: Bool, offline: Bool) -> CGRect {
         let a = anim, u = a.util, t = a.time
         let stride = sleeping ? 0 : min(1, u * 2.5)
         let turbo = mood == "turbo" && !sleeping
@@ -1155,7 +1238,7 @@ struct SceneCanvas: View {
         var pc = c
         if offline { pc.addFilter(.grayscale(1)) }
         if sleeping { pc.opacity = 0.9 }
-        pc.draw(pc.resolve(Image(nsImage: image)), in: CGRect(x: -wid / 2, y: -hgt, width: wid, height: hgt))
+        pc.draw(pc.resolve(Image(platformImage: image)), in: CGRect(x: -wid / 2, y: -hgt, width: wid, height: hgt))
 
         return CGRect(x: cx - wid / 2, y: groundY - 1 - hop - hgt * squash, width: wid, height: hgt * 0.5)
     }
@@ -1505,10 +1588,7 @@ struct ProcessRow: View {
         .contentShape(Rectangle())
         .help([p.command, p.cwd.map { "in \($0)" }].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n"))
         .contextMenu {
-            Button("Copy Command") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(p.command ?? p.name, forType: .string)
-            }
+            Button("Copy Command") { copyToClipboard(p.command ?? p.name) }
             Text("PID \(p.pid)")
         }
     }
@@ -1516,6 +1596,7 @@ struct ProcessRow: View {
 
 /// Drag here to move the window. The rest of the window no longer moves on drag,
 /// so the timeline can be scrubbed.
+#if os(macOS)
 struct WindowDragArea: NSViewRepresentable {
     final class DragView: NSView {
         override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
@@ -1523,6 +1604,11 @@ struct WindowDragArea: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { DragView() }
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
+#else
+struct WindowDragArea: View {
+    var body: some View { Color.clear.allowsHitTesting(false) }
+}
+#endif
 
 /// Distinct colors for the busiest processes, in legend order.
 let processPalette: [Color] = [
@@ -1629,7 +1715,11 @@ struct TimelineBar: View {
                 } else if let e = store.timeline?.energy, e.gpu_j > 0 {
                     Text("⚡ GPU used \(energyText(e.gpu_j))").foregroundColor(Color(red: 1, green: 0.62, blue: 0.35))
                 } else {
+                    #if os(macOS)
                     Text("hover to peek · drag to rewind")
+                    #else
+                    Text("drag to rewind")
+                    #endif
                 }
                 Spacer()
                 Text("now")
@@ -1790,8 +1880,12 @@ func bigNumber(_ v: Double) -> String {
 @MainActor func hype(_ store: GPUStore, tick: Int) -> String {
     guard store.online, let s = store.shown else {
         if store.host.isLocal {
+            #if os(macOS)
             return Service.isInstalled ? "gpud is starting… (logs: ~/Library/Logs/gpud.log) 🔌"
                                        : "Install the background service (GPU Buddy menu) to wake me up 🔌"
+            #else
+            return "Pair a Mac running gpud in the Macs tab to see its GPU 🔌"
+            #endif
         }
         return "Can't reach \(store.host.name): \(store.problem ?? "offline") 🔌"
     }
@@ -1897,7 +1991,9 @@ struct ContentView: View {
                 .frame(width: 18, height: 18)
                 .background(Circle().fill(.white.opacity(0.16)))
         }
+        #if os(macOS)
         .menuStyle(.borderlessButton)
+        #endif
         .menuIndicator(.hidden)
         .fixedSize()
         .help("Change character (⌘J)")
@@ -1918,13 +2014,15 @@ struct ContentView: View {
     private func full(_ s: Snapshot?) -> some View {
         VStack(spacing: 8) {
             SceneCanvas(anim: anim, mood: store.mood, badge: badge, character: characters.current)
-                .frame(height: 150)
+                .frame(height: sceneHeight)
                 .clipped()
                 .overlay(WindowDragArea())
                 .overlay(alignment: .topTrailing) {
                     HStack(spacing: 5) {
                         characterMenu
+                        #if os(macOS)
                         modeButton("rectangle.compress.vertical")
+                        #endif
                     }
                     .padding(8)
                 }
@@ -1985,8 +2083,14 @@ struct ContentView: View {
             .padding(.horizontal, 14)
             .padding(.bottom, 12)
         }
-        .frame(width: 264)
+        .panelWidth(264)
     }
+
+    #if os(macOS)
+    private let sceneHeight = 150.0
+    #else
+    private let sceneHeight = 210.0
+    #endif
 
     // Compact strip: mini Chippy + the essentials.
     private func compact(_ s: Snapshot?) -> some View {
@@ -2080,96 +2184,6 @@ struct AppIcon: View {
     }
 }
 
-// MARK: - Background service (gpud) bundled inside the app
-
-/// Installs, updates and removes gpud as a LaunchAgent, from the copy bundled in the app.
-/// The files are copied to Application Support so the service keeps working wherever the app moves.
-@MainActor
-enum Service {
-    static let label = "local.gpubuddy.gpud"
-    static let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/GPUBuddy")
-    static let installed = support.appendingPathComponent("daemon")
-    static let plist = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(label).plist")
-    static var bundled: URL? { Bundle.main.resourceURL?.appendingPathComponent("daemon") }
-
-    /// gpud is set up by some means (this app, or ./install.sh from the repo).
-    static var isInstalled: Bool { FileManager.default.fileExists(atPath: plist.path) }
-
-    /// Set up by this app (as opposed to ./install.sh), so the app may update and remove it.
-    static var isOurs: Bool {
-        guard let d = NSDictionary(contentsOf: plist), let args = d["ProgramArguments"] as? [String] else { return false }
-        return args.contains { $0.hasPrefix(installed.path) }
-    }
-
-    static func version(at dir: URL) -> String? {
-        guard let src = try? String(contentsOf: dir.appendingPathComponent("gpud.py"), encoding: .utf8),
-              let line = src.split(separator: "\n").first(where: { $0.hasPrefix("VERSION = ") }) else { return nil }
-        return line.split(separator: "\"").dropFirst().first.map(String.init)
-    }
-
-    static func install() throws {
-        guard let bundled else { throw NSError(domain: "GPUBuddy", code: 1, userInfo: [NSLocalizedDescriptionKey: "This copy of GPU Buddy has no bundled gpud."]) }
-        let fm = FileManager.default
-        try fm.createDirectory(at: installed, withIntermediateDirectories: true)
-        for name in try fm.contentsOfDirectory(atPath: bundled.path) {
-            let dst = installed.appendingPathComponent(name)
-            try? fm.removeItem(at: dst)
-            try fm.copyItem(at: bundled.appendingPathComponent(name), to: dst)
-        }
-        let logs = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs")
-        try fm.createDirectory(at: plist.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try fm.createDirectory(at: logs, withIntermediateDirectories: true)
-        let job: [String: Any] = [
-            "Label": label,
-            "ProgramArguments": ["/usr/bin/python3", installed.appendingPathComponent("gpud.py").path, "--port", "8765"],
-            "RunAtLoad": true,
-            "KeepAlive": true,
-            "ProcessType": "Background",
-            "StandardOutPath": logs.appendingPathComponent("gpud.log").path,
-            "StandardErrorPath": logs.appendingPathComponent("gpud.log").path,
-        ]
-        let data = try PropertyListSerialization.data(fromPropertyList: job, format: .xml, options: 0)
-        try data.write(to: plist)
-        launchctl(["bootout", "gui/\(getuid())/\(label)"])
-        launchctl(["bootstrap", "gui/\(getuid())", plist.path])
-    }
-
-    /// When the app carries a newer gpud than the one it installed, swap it in and restart it.
-    static func updateIfNeeded() {
-        guard isOurs, let bundled, let new = version(at: bundled), new != version(at: installed) else { return }
-        try? install()
-    }
-
-    static func uninstall() {
-        launchctl(["bootout", "gui/\(getuid())/\(label)"])
-        try? FileManager.default.removeItem(at: plist)
-    }
-
-    @discardableResult
-    private static func launchctl(_ args: [String]) -> Int32 {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        p.arguments = args
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
-        return p.terminationStatus
-    }
-
-    /// /usr/bin/python3 needs Apple's Command Line Tools; without them macOS offers to install them.
-    static var hasCommandLineTools: Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
-        p.arguments = ["-p"]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
-        return p.terminationStatus == 0
-    }
-}
-
 // MARK: - Macs (switch between this Mac and others on the network)
 
 /// One chip per Mac with its live %, plus a ＋ to pair more.
@@ -2180,7 +2194,7 @@ struct HostBar: View {
         HStack(spacing: 4) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
-                    ForEach(fleet.stores, id: \.host.id) { s in
+                    ForEach(fleet.watched, id: \.host.id) { s in
                         HostChip(store: s, selected: s === fleet.current) { fleet.select(s) }
                     }
                 }
@@ -2253,11 +2267,14 @@ struct MacsView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("🖥 Macs").font(.system(size: 17, weight: .heavy, design: .rounded))
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 22)
+                .padding(.top, titleBarInset)
                 .background(WindowDragArea())
 
             section("WATCHING") {
-                ForEach(fleet.stores, id: \.host.id) { s in PairedRow(store: s, fleet: fleet) }
+                if fleet.watched.isEmpty {
+                    note("No Macs yet. Pair one below: on the Mac, open GPU Buddy → Macs and copy its pairing code.")
+                }
+                ForEach(fleet.watched, id: \.host.id) { s in PairedRow(store: s, fleet: fleet) }
             }
 
             section("ON YOUR NETWORK") {
@@ -2313,6 +2330,7 @@ struct MacsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if Fleet.hasLocal {
             section("SHARE THIS MAC") {
                 if let p = fleet.thisMac, p.remote, let c = p.code {
                     HStack {
@@ -2320,8 +2338,7 @@ struct MacsView: View {
                             .textSelection(.enabled)
                         Spacer()
                         pill(copied ? "Copied" : "Copy") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(c, forType: .string)
+                            copyToClipboard(c)
                             copied = true
                         }
                     }
@@ -2332,12 +2349,15 @@ struct MacsView: View {
                     note("gpud isn't running on this Mac, so it can't be watched from elsewhere. You can still watch other Macs.")
                 }
             }
+            }
         }
         .padding(.horizontal, 16).padding(.bottom, 16)
-        .frame(width: 400, alignment: .topLeading)
+        .panelWidth(400)
         .foregroundColor(.white)
         .background(Color(red: 0.1, green: 0.09, blue: 0.15))
+        #if os(macOS)
         .ignoresSafeArea()
+        #endif
     }
 
     private func connect(_ address: String, _ code: String) {
@@ -2678,10 +2698,14 @@ struct LedgerView: View {
         ScrollView(.vertical) {
             content
         }
-        .frame(width: 380)
+        .panelWidth(380)
+        #if os(macOS)
         .frame(minHeight: 560)
+        #endif
         .background(ground)
+        #if os(macOS)
         .ignoresSafeArea()
+        #endif
     }
 
     private var content: some View {
@@ -2694,7 +2718,7 @@ struct LedgerView: View {
                 Text(ledger.online ? "" : "gpud offline").font(.system(size: 10, weight: .bold, design: .rounded))
                     .foregroundColor(.orange)
             }
-            .padding(.top, 22)  // clears the traffic lights
+            .padding(.top, titleBarInset)
             .background(WindowDragArea())
 
             presets
@@ -2715,7 +2739,7 @@ struct LedgerView: View {
             models
         }
         .padding(.horizontal, 16).padding(.bottom, 14)
-        .frame(width: 380, alignment: .top)
+        .panelWidth(380)
         .foregroundColor(.white)
     }
 
@@ -2878,7 +2902,9 @@ struct LedgerView: View {
                 Text("Batch API (50% off, results within 24h: fine for work nobody waits on)")
                     .font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.7))
             }
+            #if os(macOS)
             .toggleStyle(.checkbox)
+            #endif
 
             if rows.isEmpty {
                 Text(ledger.online ? "No tokens in this period." : "gpud offline").font(.system(size: 10, weight: .medium, design: .rounded))
@@ -3069,13 +3095,18 @@ struct LedgerView: View {
                 }
                 .chartOverlay { proxy in
                     GeometryReader { geo in
+                        let pick = { (x: CGFloat?) in
+                            guard let x, let plot = proxy.plotFrame.map({ geo[$0] }),
+                                  let d: Date = proxy.value(atX: x - plot.minX) else { hover = nil; return }
+                            hover = series.min { abs($0.date.timeIntervalSince(d)) < abs($1.date.timeIntervalSince(d)) }
+                        }
                         Rectangle().fill(.clear).contentShape(Rectangle())
                             .onContinuousHover { phase in
-                                guard case .active(let p) = phase,
-                                      let plot = proxy.plotFrame.map({ geo[$0] }),
-                                      let d: Date = proxy.value(atX: p.x - plot.minX) else { hover = nil; return }
-                                hover = series.min { abs($0.date.timeIntervalSince(d)) < abs($1.date.timeIntervalSince(d)) }
+                                if case .active(let p) = phase { pick(p.x) } else { pick(nil) }
                             }
+                            #if os(iOS)
+                            .gesture(DragGesture(minimumDistance: 0).onChanged { pick($0.location.x) })
+                            #endif
                     }
                 }
                 .font(.system(size: 9, weight: .semibold, design: .rounded))
@@ -3127,263 +3158,4 @@ struct LedgerView: View {
             }
         }
     }
-}
-
-// MARK: - App
-
-@MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
-    var window: NSWindow!
-    var fleet: Fleet!
-    let characters = Characters()
-    var ledgerWindow: NSWindow?
-    var macsWindow: NSWindow?
-    private var port = 8765
-    private var lastIcon = -2
-
-    func applicationDidFinishLaunching(_ note: Notification) {
-        port = Int(ProcessInfo.processInfo.environment["GPUD_PORT"] ?? "") ?? 8765
-        fleet = Fleet(localPort: port)
-        fleet.onUpdate = { [weak self] s in self?.updateDockIcon(s) }
-        fleet.onOpenLedger = { [weak self] in self?.openLedger() }
-        fleet.onOpenMacs = { [weak self] in self?.openMacs() }
-        fleet.onSelect = { [weak self] in self?.hostChanged() }
-        fleet.onCompactChange = { [weak self] in
-            DispatchQueue.main.async { self?.fitWindow(animate: true) }
-        }
-
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 520),
-                          styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
-                          backing: .buffered, defer: false)
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
-        window.title = "GPU Buddy"
-        window.isMovableByWindowBackground = false  // drag via Chippy's scene; lets the timeline scrub
-        window.backgroundColor = NSColor(red: 0.1, green: 0.09, blue: 0.15, alpha: 1)
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.contentView = NSHostingView(rootView: RootView(fleet: fleet, characters: characters, anim: Anim()))
-        window.delegate = self
-        window.setFrameAutosaveName("GPUBuddyWindow")
-        let restored = window.setFrameUsingName("GPUBuddyWindow")
-        fitWindow(animate: false)
-        if !restored { window.center() }
-        window.makeKeyAndOrderFront(nil)
-
-        NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                let visible = self.window.occlusionState.contains(.visible)
-                self.fleet.stores.forEach { $0.visible = visible }
-            }
-        }
-
-        NSApp.mainMenu = makeMenu()
-        NSApp.activate(ignoringOtherApps: true)
-        Service.updateIfNeeded()
-        fleet.start()
-        if !Service.isInstalled && Service.bundled != nil && !UserDefaults.standard.bool(forKey: "skipServiceSetup") {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.offerService(firstRun: true) }
-        }
-    }
-
-    /// Asks before installing gpud: it runs in the background and starts at login.
-    @objc func offerService(firstRun: Bool = false) {
-        let alert = NSAlert()
-        alert.messageText = "Install the GPU Buddy service?"
-        alert.informativeText = """
-            GPU Buddy reads your GPU through a small background service, gpud. It starts at login, uses about 1% CPU, \
-            and keeps 24 hours of GPU history plus your token and energy ledger on this Mac.
-
-            Other Macs can watch this one only with its pairing code, over an encrypted connection.
-            \(Service.hasCommandLineTools ? "" : "\nmacOS will ask to install the Command Line Developer Tools (for Python). Click Install; gpud starts by itself when they're ready.\n")
-            Only want to watch other Macs? Choose Not Now.
-            """
-        alert.addButton(withTitle: "Install")
-        alert.addButton(withTitle: "Not Now")
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            if firstRun { UserDefaults.standard.set(true, forKey: "skipServiceSetup") }
-            return
-        }
-        do {
-            try Service.install()
-            if !Service.hasCommandLineTools {
-                // Running python3 once makes macOS show its "install the tools" dialog.
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-                p.arguments = ["--version"]
-                try? p.run()
-            }
-        } catch {
-            let fail = NSAlert(error: error)
-            fail.runModal()
-        }
-    }
-
-    @objc func removeService() {
-        let alert = NSAlert()
-        alert.messageText = "Remove the GPU Buddy service?"
-        alert.informativeText = "gpud stops and won't start at login. Your history and ledger stay in ~/Library/Application Support/GPUBuddy."
-        alert.addButton(withTitle: "Remove")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn { Service.uninstall() }
-    }
-
-    func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        switch item.action {
-        case #selector(offerService(firstRun:)): return Service.bundled != nil && !Service.isInstalled
-        case #selector(removeService): return Service.isOurs
-        default: return true
-        }
-    }
-
-    private func makeMenu() -> NSMenu {
-        let main = NSMenu()
-        let appItem = NSMenuItem()
-        main.addItem(appItem)
-        let appMenu = NSMenu()
-        let pin = NSMenuItem(title: "Keep on Top", action: #selector(toggleOnTop(_:)), keyEquivalent: "t")
-        pin.target = self
-        appMenu.addItem(pin)
-        let compact = NSMenuItem(title: "Compact View", action: #selector(toggleCompact), keyEquivalent: "1")
-        compact.target = self
-        appMenu.addItem(compact)
-        let ledger = NSMenuItem(title: "Token Ledger…", action: #selector(openLedger), keyEquivalent: "l")
-        ledger.target = self
-        appMenu.addItem(ledger)
-        appMenu.addItem(.separator())
-        for (title, action, key) in [("Macs…", #selector(openMacs), "k"), ("Next Mac", #selector(nextMac), "]"),
-                                     ("Previous Mac", #selector(previousMac), "["), ("Next Character", #selector(nextCharacter), "j"),
-                                     ("Add Character from Photo…", #selector(addCharacter), "")] {
-            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
-            item.target = self
-            appMenu.addItem(item)
-        }
-        appMenu.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
-        appMenu.addItem(.separator())
-        for (title, action) in [("Install Background Service…", #selector(offerService(firstRun:))),
-                                ("Remove Background Service…", #selector(removeService))] {
-            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-            item.target = self
-            appMenu.addItem(item)
-        }
-        appMenu.addItem(.separator())
-        appMenu.addItem(NSMenuItem(title: "Quit GPU Buddy", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-        appItem.submenu = appMenu
-        return main
-    }
-
-    @objc func openLedger() {
-        if ledgerWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 760),
-                             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-                             backing: .buffered, defer: false)
-            w.titlebarAppearsTransparent = true
-            w.titleVisibility = .hidden
-            w.title = "Token Ledger"
-            w.contentMinSize = NSSize(width: 380, height: 420)
-            w.contentMaxSize = NSSize(width: 380, height: 4000)
-            w.isReleasedWhenClosed = false
-            w.backgroundColor = window.backgroundColor
-            w.appearance = NSAppearance(named: .darkAqua)
-            w.contentView = ledgerContent()
-            w.setFrameAutosaveName("GPUBuddyLedger2")
-            if !w.setFrameUsingName("GPUBuddyLedger2") {
-                w.setFrameTopLeftPoint(NSPoint(x: window.frame.maxX + 12, y: window.frame.maxY))
-            }
-            ledgerWindow = w
-        }
-        ledgerWindow?.makeKeyAndOrderFront(nil)
-    }
-
-    @objc func toggleCompact() {
-        fleet.compact.toggle()
-    }
-
-    private func ledgerContent() -> NSView {
-        let ledger = Ledger(client: fleet.current.client, hostName: fleet.current.host.title,
-                            machine: fleet.current.snap?.host?.model_name ?? "Mac")
-        return NSHostingView(rootView: LedgerView(ledger: ledger))
-    }
-
-    /// Another Mac was picked: the ledger and Dock icon follow it.
-    private func hostChanged() {
-        lastIcon = -2
-        if let w = ledgerWindow { w.contentView = ledgerContent() }
-    }
-
-    @objc func openMacs() {
-        if macsWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 520),
-                             styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
-            w.titlebarAppearsTransparent = true
-            w.titleVisibility = .hidden
-            w.title = "Macs"
-            w.isReleasedWhenClosed = false
-            w.backgroundColor = window.backgroundColor
-            w.appearance = NSAppearance(named: .darkAqua)
-            let host = NSHostingView(rootView: MacsView(fleet: fleet))
-            host.sizingOptions = [.preferredContentSize]
-            w.contentView = host
-            w.center()
-            macsWindow = w
-        }
-        macsWindow?.makeKeyAndOrderFront(nil)
-    }
-
-    @objc func nextMac() { fleet.step(1) }
-    @objc func nextCharacter() { characters.next() }
-    @objc func addCharacter() { characters.addFromPanel() }
-    @objc func previousMac() { fleet.step(-1) }
-
-    /// Resize to the SwiftUI content, keeping the window's top edge in place.
-    private func fitWindow(animate: Bool) {
-        let size = window.contentView!.fittingSize
-        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: size))
-        frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height)
-        window.setFrame(frame, display: true, animate: animate)
-        // The traffic lights would sit on top of mini Chippy; ⌘M still minimizes.
-        for b in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-            window.standardWindowButton(b)?.isHidden = fleet.compact
-        }
-    }
-
-    @objc func toggleOnTop(_ item: NSMenuItem) {
-        window.level = window.level == .floating ? .normal : .floating
-        item.state = window.level == .floating ? .on : .off
-    }
-
-    private func updateDockIcon(_ s: GPUStore) {
-        let pct = s.online ? Int(s.liveUtil * 100) : -1
-        guard pct != lastIcon else { return }
-        lastIcon = pct
-        let renderer = ImageRenderer(content: DockIcon(util: s.liveUtil, online: s.online))
-        renderer.scale = 1
-        if let img = renderer.nsImage { NSApp.applicationIconImage = img }
-    }
-
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if window.isMiniaturized { window.deminiaturize(nil) }
-        window.makeKeyAndOrderFront(nil)
-        return true
-    }
-
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-}
-
-MainActor.assumeIsolated {
-    // Used by build.sh: `GPUBuddy --render-icon out.png` draws the app icon and exits.
-    if let i = CommandLine.arguments.firstIndex(of: "--render-icon"), i + 1 < CommandLine.arguments.count {
-        let r = ImageRenderer(content: AppIcon())
-        r.scale = 1
-        if let img = r.nsImage, let t = img.tiffRepresentation, let b = NSBitmapImageRep(data: t),
-           let png = b.representation(using: .png, properties: [:]) {
-            try? png.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
-        }
-        exit(0)
-    }
-    let app = NSApplication.shared
-    let delegate = AppDelegate()
-    app.delegate = delegate
-    app.setActivationPolicy(.regular)
-    app.run()
 }

@@ -7,3 +7,4 @@ dist/
 # Your own photos stay local (photo characters live in ~/Library/Application Support/GPUBuddy/characters)
 *.HEIC
 *.heic
+app/build-ios/

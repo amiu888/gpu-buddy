@@ -11,6 +11,21 @@ Get the DMG from [Releases](https://github.com/amiu888/gpu-buddy/releases/latest
 
 To make a DMG yourself, run `./release.sh`. It writes `dist/GPU-Buddy-<version>.dmg`.
 
+## iPhone and iPad
+
+GPU Buddy also runs on iPhone and iPad (iOS 17+), as a viewer for your Macs. A phone can't run gpud, so it pairs with Macs that do, over the same encrypted connection. It has three tabs: **Live** (Chippy, GPU, tokens, power, processes, timeline), **Ledger** (token usage, energy and cloud cost) and **Macs** (find and pair Macs). Characters work too, including new ones from your photo library.
+
+To install on your own device (needs Xcode and a free or paid Apple developer account signed in to Xcode):
+
+```bash
+./app/build-ios.sh device      # builds, signs with your Apple Development certificate, installs on a connected iPhone/iPad
+./app/build-ios.sh sim         # or try it in the iOS Simulator
+```
+
+Unlock the device and connect it by USB or the same Wi-Fi first, with Developer Mode on (Settings → Privacy & Security). On first launch, allow **Local Network** access, then pair a Mac in the **Macs** tab with its pairing code. The phone needs to be on the same network as the Mac.
+
+The views are shared: `app/GPUBuddy.swift` is used by both apps, `app/mac/main.swift` is the Mac shell, and `app/ios/GPUBuddyApp.swift` is the iOS shell.
+
 ## Install from source
 
 ```bash

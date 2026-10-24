@@ -6,7 +6,7 @@ APP="GPU Buddy.app"
 VERSION="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' ../daemon/gpud.py)"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/daemon"
-swiftc -O -swift-version 5 -target arm64-apple-macos14.0 -o "$APP/Contents/MacOS/GPUBuddy" GPUBuddy.swift \
+swiftc -O -swift-version 5 -target arm64-apple-macos14.0 -o "$APP/Contents/MacOS/GPUBuddy" GPUBuddy.swift mac/main.swift \
     -framework SwiftUI -framework AppKit -framework Charts
 
 # The background service: gpud plus a prebuilt power helper, so users need no compiler.

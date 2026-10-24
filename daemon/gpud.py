@@ -1125,19 +1125,22 @@ class Identity:
         return ctx
 
 
-class DualStackServer(ThreadingHTTPServer):
-    """Listens on IPv6 and IPv4, so "Studio.local" works whichever address it resolves to."""
-    address_family = socket.AF_INET6
+class QuietServer(ThreadingHTTPServer):
     daemon_threads = True
-
-    def server_bind(self):
-        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-        super().server_bind()
 
     def handle_error(self, request, client_address):
         if isinstance(sys.exc_info()[1], (ssl.SSLError, ConnectionError, socket.timeout)):
             return  # plain-HTTP probes, port scans, viewers that went away
         super().handle_error(request, client_address)
+
+
+class DualStackServer(QuietServer):
+    """Listens on IPv6 and IPv4, so "Studio.local" works whichever address it resolves to."""
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
 
 
 def load_prices():
@@ -1408,8 +1411,7 @@ def main():
             identity = None
             print(f"gpud: remote viewing off: {e}", file=sys.stderr, flush=True)
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(sampler, identity))
-    server.daemon_threads = True
+    server = QuietServer((args.host, args.port), make_handler(sampler, identity))
     print(f"gpud {VERSION}: {sampler._static['model']} ({sampler._static['cores']} cores) "
           f"on http://{args.host}:{args.port}", flush=True)
     try:
