@@ -92,6 +92,16 @@ GPU history is kept for 24 hours in `~/Library/Application Support/GPUBuddy/hist
 
 Memory is what the GPU has allocated out of unified memory, similar to "VRAM used". The TFLOPS and "ops crunched" numbers are estimates: cores × 128 ALUs × 2 × ~1.5 GHz.
 
+## Characters
+
+Click the 🎭 button on the scene, or press ⌘J to cycle through characters:
+
+- **🐱 Chippy:** the kitty-eared chip.
+- **🐰 Witch Bunny:** a chunky crocheted bunny in a witch hat, drawn stitch by stitch. She hops harder as the GPU works, her ears flap and her hat lags behind each hop. She naps with her hat drooping, sweats when hustling, and in turbo she hops on her broom and flies.
+- **📷 Your photo:** use **Add Character from Photo…** to pick a photo of a toy, a pet, anything with a clear subject. Apple's Vision framework cuts it out of the background on your Mac, and it then hops, squashes and stretches with the GPU. Photo characters stay on your Mac in `~/Library/Application Support/GPUBuddy/characters`.
+
+Every character gets the same moods, sparkles, sweat and Zzz.
+
 ## What Chippy does
 
 | GPU load | Mood | Animation |

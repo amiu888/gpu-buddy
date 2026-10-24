@@ -6,6 +6,8 @@ import Charts
 import CryptoKit
 import Network
 import SwiftUI
+import UniformTypeIdentifiers
+import Vision
 
 // MARK: - API model
 
@@ -618,7 +620,140 @@ final class Anim {
     }
 }
 
-// MARK: - The scene: Chippy, the kitty chip who runs as hard as your GPU
+// MARK: - Characters (Chippy, Witch Bunny, or any photo you add)
+
+/// What the scene draws.
+enum CharacterKind {
+    case chippy
+    case bunny
+    case photo(NSImage)
+}
+
+/// The characters to choose from: the built-in ones plus photo characters, which are cut out of
+/// your photos with Vision and kept in ~/Library/Application Support/GPUBuddy/characters.
+@MainActor
+final class Characters: ObservableObject {
+    struct Entry: Identifiable, Codable {
+        let id: String
+        let name: String
+    }
+
+    static let builtIn = [Entry(id: "chippy", name: "🐱 Chippy"), Entry(id: "bunny", name: "🐰 Witch Bunny")]
+
+    @Published var selected = UserDefaults.standard.string(forKey: "character") ?? "chippy" {
+        didSet { UserDefaults.standard.set(selected, forKey: "character") }
+    }
+    @Published private(set) var photos: [Entry] = []
+    @Published private(set) var busy = false
+    private var images: [String: NSImage] = [:]
+    private let dir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/GPUBuddy/characters")
+    private var index: URL { dir.appendingPathComponent("index.json") }
+
+    init() {
+        if let data = try? Data(contentsOf: index), let list = try? JSONDecoder().decode([Entry].self, from: data) {
+            for e in list {
+                if let img = NSImage(contentsOf: dir.appendingPathComponent("\(e.id).png")) {
+                    images[e.id] = img
+                    photos.append(e)
+                }
+            }
+        }
+        if Self.builtIn.allSatisfy({ $0.id != selected }) && images[selected] == nil { selected = "chippy" }
+    }
+
+    var all: [Entry] { Self.builtIn + photos.map { Entry(id: $0.id, name: "📷 " + $0.name) } }
+
+    var current: CharacterKind {
+        switch selected {
+        case "bunny": return .bunny
+        case "chippy": return .chippy
+        default: return images[selected].map { .photo($0) } ?? .chippy
+        }
+    }
+
+    var currentIsPhoto: Bool { images[selected] != nil }
+    var currentName: String { all.first { $0.id == selected }?.name ?? "" }
+
+    func next() {
+        let ids = all.map(\.id)
+        selected = ids[((ids.firstIndex(of: selected) ?? -1) + 1) % ids.count]
+    }
+
+    /// Lifts the subject out of a photo and adds it as a character.
+    func add(from url: URL, name: String) async throws {
+        busy = true
+        defer { busy = false }
+        let png = try await Task.detached(priority: .userInitiated) { try Self.cutout(url) }.value
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let id = "photo-" + UUID().uuidString.prefix(8).lowercased()
+        try png.write(to: dir.appendingPathComponent("\(id).png"))
+        guard let img = NSImage(data: png) else { return }
+        images[id] = img
+        photos.append(Entry(id: id, name: name))
+        saveIndex()
+        selected = id
+    }
+
+    func remove(_ id: String) {
+        guard images[id] != nil else { return }
+        images[id] = nil
+        photos.removeAll { $0.id == id }
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("\(id).png"))
+        saveIndex()
+        if selected == id { selected = "chippy" }
+    }
+
+    func addFromPanel() {
+        let panel = NSOpenPanel()
+        panel.message = "Pick a photo of a toy, pet or anything with a clear subject. GPU Buddy cuts it out and animates it."
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            do {
+                try await add(from: url, name: url.deletingPathExtension().lastPathComponent)
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "Couldn't make a character from that photo"
+                alert.informativeText = error.localizedDescription
+                alert.runModal()
+            }
+        }
+    }
+
+    private func saveIndex() {
+        try? JSONEncoder().encode(photos).write(to: index)
+    }
+
+    /// The photo's main subject on a transparent background, cropped to it, as PNG.
+    nonisolated static func cutout(_ url: URL) throws -> Data {
+        let fail = { (msg: String) in NSError(domain: "GPUBuddy", code: 2, userInfo: [NSLocalizedDescriptionKey: msg]) }
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { throw fail("That file isn't an image.") }
+        let opts: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                     kCGImageSourceCreateThumbnailWithTransform: true,  // upright, whatever the camera did
+                                     kCGImageSourceThumbnailMaxPixelSize: 1400]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { throw fail("Couldn't read the image.") }
+        let handler = VNImageRequestHandler(cgImage: cg)
+        let request = VNGenerateForegroundInstanceMaskRequest()
+        try handler.perform([request])
+        guard let obs = request.results?.first, !obs.allInstances.isEmpty else {
+            throw fail("No clear subject found. Try a photo where it stands out from the background.")
+        }
+        let buffer = try obs.generateMaskedImage(ofInstances: obs.allInstances, from: handler, croppedToInstancesExtent: true)
+        let ci = CIImage(cvPixelBuffer: buffer)
+        // Keep it light: the scene draws it at most ~100pt tall.
+        let scale = min(1, 600 / ci.extent.height)
+        let small = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let out = CIContext().createCGImage(small, from: small.extent),
+              let png = NSBitmapImageRep(cgImage: out).representation(using: .png, properties: [:]) else {
+            throw fail("Couldn't save the cut-out.")
+        }
+        return png
+    }
+}
+
+// MARK: - The scene: Chippy (or another character) running as hard as your GPU
 
 /// Chippy is drawn in a 150pt-tall design space and scaled to fit, so the same
 /// drawing serves the full window and the compact strip.
@@ -628,6 +763,7 @@ struct SceneCanvas: View {
     let anim: Anim
     let mood: String
     var badge: String? = nil
+    var character: CharacterKind = .chippy
 
     var body: some View {
         Canvas { ctx, size in
@@ -645,6 +781,382 @@ struct SceneCanvas: View {
         p.addArc(center: CGPoint(x: c.x + r * 0.5, y: c.y - r * 0.25), radius: r * 0.5, startAngle: .degrees(180), endAngle: .degrees(0), clockwise: false)
         p.addCurve(to: CGPoint(x: c.x, y: c.y + r), control1: CGPoint(x: c.x + r, y: c.y + r * 0.3), control2: CGPoint(x: c.x + r * 0.4, y: c.y + r * 0.6))
         return p
+    }
+
+    // MARK: Chippy: the kitty-eared chip.
+
+    private func drawChippy(_ ctx: GraphicsContext, cx: Double, groundY: Double, bob: Double, sleeping: Bool,
+                            offline: Bool) -> (GraphicsContext, CGRect) {
+        let a = anim, u = a.util, t = a.time
+            var c = ctx
+            c.translateBy(x: cx, y: groundY)
+            c.rotate(by: .radians(sleeping ? 0 : u * 0.12))
+            c.translateBy(x: -cx, y: -groundY)
+
+            let bw = 64.0, bh = 54.0
+            let bodyBottom = groundY - 11 - bob
+            let body = CGRect(x: cx - bw / 2, y: bodyBottom - bh, width: bw, height: bh)
+            let gold = Color(red: 1, green: 0.8, blue: 0.45)
+            let shell1 = Color(red: 0.98, green: 0.96, blue: 1)
+            let shell2 = Color(red: 0.8, green: 0.78, blue: 0.97)
+            let pink = Color(red: 1, green: 0.55, blue: 0.7)
+
+            // Turbo rocket flames.
+            if u > 0.82 && !sleeping {
+                let f = 0.75 + 0.25 * sin(t * 40) + 0.15 * sin(t * 23)
+                let outer = CGRect(x: body.minX - 4 - 30 * f, y: body.midY + 6 - 9 * f, width: 34 * f, height: 18 * f)
+                c.drawLayer { l in
+                    l.addFilter(.blur(radius: 3))
+                    l.fill(Path(ellipseIn: outer), with: .color(.orange.opacity(0.85)))
+                    l.fill(Path(ellipseIn: outer.insetBy(dx: 8 * f, dy: 4 * f).offsetBy(dx: 5, dy: 0)), with: .color(.yellow))
+                }
+            }
+
+            // USB-cable tail, wagging faster with load.
+            let wag = sin(t * (2 + u * 10)) * (sleeping ? 2 : 7)
+            var tail = Path()
+            let tailStart = CGPoint(x: body.minX + 4, y: body.maxY - 12)
+            tail.move(to: tailStart)
+            let tailEnd = CGPoint(x: tailStart.x - 22, y: tailStart.y - 16 + wag)
+            tail.addCurve(to: tailEnd, control1: CGPoint(x: tailStart.x - 14, y: tailStart.y + 6), control2: CGPoint(x: tailEnd.x + 4, y: tailEnd.y + 14))
+            c.stroke(tail, with: .color(Color(white: 0.35)), style: StrokeStyle(lineWidth: 3, lineCap: .round))
+            c.fill(Path(roundedRect: CGRect(x: tailEnd.x - 4, y: tailEnd.y - 7, width: 8, height: 9), cornerRadius: 2), with: .color(Color(white: 0.75)))
+
+            // Stubby pin legs.
+            let stride = sleeping ? 0 : min(1, u * 2)
+            for i in 0..<2 {
+                let ph = a.runPhase * .pi * 2 + Double(i) * .pi
+                let hip = CGPoint(x: cx + (i == 0 ? -13 : 13), y: bodyBottom - 2)
+                let foot = CGPoint(x: hip.x + sin(ph) * 9 * stride, y: groundY - 3 - max(0, cos(ph)) * 6 * stride)
+                var leg = Path()
+                leg.move(to: hip)
+                leg.addLine(to: foot)
+                c.stroke(leg, with: .color(gold), style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                c.fill(Path(ellipseIn: CGRect(x: foot.x - 6, y: foot.y - 3, width: 12, height: 6)), with: .color(Color(red: 0.98, green: 0.7, blue: 0.8)))
+            }
+
+            // Little arm pins.
+            for side in [-1.0, 1.0] {
+                let swing = sin(a.runPhase * .pi * 2 + (side > 0 ? 0 : .pi)) * 5 * stride
+                let px = side < 0 ? body.minX - 6 : body.maxX - 1
+                c.fill(Path(roundedRect: CGRect(x: px, y: body.midY + 2 + swing - 2.5, width: 7, height: 5), cornerRadius: 2.5), with: .color(gold))
+            }
+
+            // Kitty ears.
+            for side in [-1.0, 1.0] {
+                let ex = cx + side * 20
+                var ear = Path()
+                ear.move(to: CGPoint(x: ex - 9, y: body.minY + 6))
+                ear.addQuadCurve(to: CGPoint(x: ex + side * 3, y: body.minY - 12 - (sleeping ? 0 : sin(t * 3) * u * 2)), control: CGPoint(x: ex - 7, y: body.minY - 6))
+                ear.addQuadCurve(to: CGPoint(x: ex + 9, y: body.minY + 6), control: CGPoint(x: ex + 7, y: body.minY - 6))
+                c.fill(ear, with: .color(shell2))
+                var inner = Path()
+                inner.move(to: CGPoint(x: ex - 4.5, y: body.minY + 4))
+                inner.addQuadCurve(to: CGPoint(x: ex + side * 2, y: body.minY - 6), control: CGPoint(x: ex - 3.5, y: body.minY - 2))
+                inner.addQuadCurve(to: CGPoint(x: ex + 4.5, y: body.minY + 4), control: CGPoint(x: ex + 3.5, y: body.minY - 2))
+                c.fill(inner, with: .color(pink.opacity(0.75)))
+            }
+
+            // Chubby body.
+            let bodyPath = Path(roundedRect: body, cornerRadius: 22)
+            c.fill(bodyPath, with: .linearGradient(Gradient(colors: [shell1, shell2]),
+                                                   startPoint: CGPoint(x: body.minX, y: body.minY), endPoint: CGPoint(x: body.maxX, y: body.maxY)))
+            c.fill(Path(ellipseIn: CGRect(x: body.minX + 9, y: body.minY + 5, width: 16, height: 7)), with: .color(.white.opacity(0.9)))
+
+            // Propeller beanie between the ears.
+            var stem = Path()
+            stem.move(to: CGPoint(x: cx, y: body.minY + 1))
+            stem.addLine(to: CGPoint(x: cx, y: body.minY - 7))
+            c.stroke(stem, with: .color(Color(white: 0.5)), lineWidth: 2)
+            let blade = abs(cos(a.fanPhase)) * 12 + 2
+            c.fill(Path(ellipseIn: CGRect(x: cx - blade, y: body.minY - 10, width: blade * 2, height: 4.5)),
+                   with: .color(Color(hue: a.hue, saturation: 0.45, brightness: 1).opacity(u > 0.6 ? 0.75 : 1)))
+            c.fill(Path(ellipseIn: CGRect(x: cx - 2.5, y: body.minY - 10, width: 5, height: 5)), with: .color(pink))
+
+            // Face.
+            let ink = Color(red: 0.2, green: 0.17, blue: 0.32)
+            let ey = body.minY + 22
+            for side in [-1.0, 1.0] {
+                let ex = cx + side * 12
+                if offline {
+                    var xp = Path()
+                    xp.move(to: CGPoint(x: ex - 3.5, y: ey - 3.5)); xp.addLine(to: CGPoint(x: ex + 3.5, y: ey + 3.5))
+                    xp.move(to: CGPoint(x: ex + 3.5, y: ey - 3.5)); xp.addLine(to: CGPoint(x: ex - 3.5, y: ey + 3.5))
+                    c.stroke(xp, with: .color(ink), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
+                } else if sleeping {
+                    var arc = Path()
+                    arc.addArc(center: CGPoint(x: ex, y: ey - 1), radius: 4.5, startAngle: .degrees(20), endAngle: .degrees(160), clockwise: false)
+                    c.stroke(arc, with: .color(ink), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
+                } else if mood == "turbo" {
+                    var ch = Path()
+                    ch.move(to: CGPoint(x: ex - side * 4, y: ey - 4.5))
+                    ch.addLine(to: CGPoint(x: ex + side * 3, y: ey))
+                    ch.addLine(to: CGPoint(x: ex - side * 4, y: ey + 4.5))
+                    c.stroke(ch, with: .color(ink), style: StrokeStyle(lineWidth: 2.6, lineCap: .round, lineJoin: .round))
+                } else if a.blinking {
+                    var lid = Path()
+                    lid.move(to: CGPoint(x: ex - 4.5, y: ey)); lid.addLine(to: CGPoint(x: ex + 4.5, y: ey))
+                    c.stroke(lid, with: .color(ink), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
+                } else {
+                    // Big sparkly anime eyes.
+                    c.fill(Path(ellipseIn: CGRect(x: ex - 5, y: ey - 6.5, width: 10, height: 13)), with: .color(ink))
+                    c.fill(Path(ellipseIn: CGRect(x: ex - 3, y: ey - 4.5, width: 4.2, height: 4.2)), with: .color(.white))
+                    c.fill(Path(ellipseIn: CGRect(x: ex + 1, y: ey + 1.5, width: 2, height: 2)), with: .color(.white.opacity(0.9)))
+                    if mood == "hustling" {
+                        var brow = Path()
+                        brow.move(to: CGPoint(x: ex - side * 5, y: ey - 11))
+                        brow.addLine(to: CGPoint(x: ex + side * 4, y: ey - 9))
+                        c.stroke(brow, with: .color(ink), style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
+                    }
+                }
+                c.fill(Path(ellipseIn: CGRect(x: ex + side * 5 - 5, y: ey + 6, width: 10, height: 5)),
+                       with: .color(pink.opacity(offline ? 0 : 0.35 + 0.5 * u)))
+            }
+
+            let my = ey + 10
+            var mouth = Path()
+            switch mood {
+            case "offline":
+                mouth.addArc(center: CGPoint(x: cx, y: my + 3), radius: 3.5, startAngle: .degrees(200), endAngle: .degrees(340), clockwise: false)
+                c.stroke(mouth, with: .color(ink), style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
+            case "sleeping":
+                c.fill(Path(ellipseIn: CGRect(x: cx - 1.8, y: my - 1, width: 3.6, height: 3 + sin(t * 1.6))), with: .color(ink))
+            case "chill", "working":
+                // Cat mouth: ω
+                mouth.addArc(center: CGPoint(x: cx - 2.6, y: my - 1.5), radius: 2.6, startAngle: .degrees(0), endAngle: .degrees(180), clockwise: false)
+                mouth.addArc(center: CGPoint(x: cx + 2.6, y: my - 1.5), radius: 2.6, startAngle: .degrees(0), endAngle: .degrees(180), clockwise: false)
+                c.stroke(mouth, with: .color(ink), style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+            default:  // hustling / turbo: open grin with a tongue
+                let r = mood == "turbo" ? 5.5 : 4.5
+                mouth.move(to: CGPoint(x: cx - r, y: my - 2))
+                mouth.addArc(center: CGPoint(x: cx, y: my - 2), radius: r, startAngle: .degrees(0), endAngle: .degrees(180), clockwise: false)
+                mouth.closeSubpath()
+                c.fill(mouth, with: .color(ink))
+                c.fill(Path(ellipseIn: CGRect(x: cx - r * 0.55, y: my + r * 0.25 - 2, width: r * 1.1, height: r * 0.7)), with: .color(pink))
+            }
+
+            // Tiny gold chip badge on the tummy.
+            c.fill(Path(roundedRect: CGRect(x: cx - 6, y: body.maxY - 12, width: 12, height: 7), cornerRadius: 2), with: .color(gold.opacity(0.85)))
+        return (c, body)
+    }
+
+    // MARK: Witch Bunny: a chunky crocheted bunny in a witch hat that hops harder as the GPU works.
+
+    /// Rows of little V stitches clipped to a shape, so it reads as chenille yarn.
+    private func knit(_ ctx: GraphicsContext, _ shape: Path, _ rect: CGRect, _ color: Color, spacing: Double = 4.6) {
+        var k = ctx
+        k.clip(to: shape)
+        var stitches = Path()
+        var y = rect.minY + 1.5
+        var row = 0
+        while y < rect.maxY + 2 {
+            var x = rect.minX + (row % 2 == 0 ? 0 : spacing / 2)
+            while x < rect.maxX + 2 {
+                stitches.move(to: CGPoint(x: x - spacing * 0.42, y: y - 1.4))
+                stitches.addQuadCurve(to: CGPoint(x: x, y: y + 1.4), control: CGPoint(x: x - spacing * 0.3, y: y + 1.2))
+                stitches.addQuadCurve(to: CGPoint(x: x + spacing * 0.42, y: y - 1.4), control: CGPoint(x: x + spacing * 0.3, y: y + 1.2))
+                x += spacing
+            }
+            y += spacing * 0.85
+            row += 1
+        }
+        k.stroke(stitches, with: .color(color), style: StrokeStyle(lineWidth: 0.9, lineCap: .round))
+        // Soft plush shading: lit from the top left.
+        k.fill(shape, with: .radialGradient(Gradient(colors: [.white.opacity(0.28), .clear, .black.opacity(0.16)]),
+                                            center: CGPoint(x: rect.minX + rect.width * 0.32, y: rect.minY + rect.height * 0.25),
+                                            startRadius: 0, endRadius: max(rect.width, rect.height) * 0.95))
+    }
+
+    private func drawBunny(_ ctx: GraphicsContext, cx: Double, groundY: Double, sleeping: Bool, offline: Bool) -> CGRect {
+        let a = anim, u = a.util, t = a.time
+        let stride = sleeping ? 0 : min(1, u * 2.5)
+        let turbo = mood == "turbo" && !sleeping
+        let ph = a.runPhase * .pi
+        let hop = turbo ? 0 : abs(sin(ph)) * (3 + 11 * u) * stride
+        let fly = turbo ? 9 + sin(t * 3) * 2.5 : 0
+        let landing = 1 - abs(sin(ph))
+        let squash = sleeping ? 1 + 0.025 * sin(t * 1.6) : 1 - 0.09 * landing * stride
+        let lift = hop + fly
+
+        let cream = offline ? Color(white: 0.82) : Color(red: 0.98, green: 0.95, blue: 0.87)
+        let shade = offline ? Color(white: 0.62) : Color(red: 0.8, green: 0.72, blue: 0.58)
+        let ink = Color(red: 0.07, green: 0.06, blue: 0.09)
+        let hatColor = Color(red: 0.14, green: 0.12, blue: 0.18)
+        let lavender = offline ? Color(white: 0.7) : Color(red: 0.74, green: 0.64, blue: 0.94)
+        let pink = Color(red: 1, green: 0.6, blue: 0.72)
+
+        var c = ctx
+        c.translateBy(x: cx, y: groundY - 2 - lift)
+        c.rotate(by: .radians(sleeping ? -0.04 : u * 0.1))
+        let k = 0.86  // hat and all, she's taller than Chippy
+        c.scaleBy(x: (2 - squash) * k, y: squash * k)
+
+        // Turbo: she hops on her broom and flies.
+        if turbo {
+            var stick = Path()
+            stick.move(to: CGPoint(x: -40, y: 3))
+            stick.addLine(to: CGPoint(x: 42, y: -9))
+            c.stroke(stick, with: .color(Color(red: 0.56, green: 0.37, blue: 0.21)), style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
+            var straw = Path()
+            for i in 0..<11 {
+                let spread = (Double(i) / 10 - 0.5) * 1.1
+                let len = 17 + 4 * sin(t * 30 + Double(i) * 1.7)
+                straw.move(to: CGPoint(x: -38, y: 3))
+                straw.addLine(to: CGPoint(x: -38 - cos(spread) * len, y: 3 + 2 + sin(spread) * len * 0.8))
+            }
+            c.stroke(straw, with: .color(Color(red: 0.98, green: 0.8, blue: 0.4)), style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
+            c.fill(Path(roundedRect: CGRect(x: -41, y: -0.5, width: 6, height: 7), cornerRadius: 1.5), with: .color(lavender))
+        }
+
+        // Long floppy ears hanging down the sides, flapping with each hop (streaming back in turbo).
+        let flap = sleeping ? 0.03 * sin(t * 1.6) : -cos(a.runPhase * .pi * 2) * 0.2 * stride
+        for side in [-1.0, 1.0] {
+            let angle = turbo ? 0.95 + 0.08 * sin(t * 9 + side) : -side * (0.3 + flap)
+            let tf = CGAffineTransform(rotationAngle: angle).concatenating(CGAffineTransform(translationX: side * 19, y: -78))
+            let rect = CGRect(x: -9.5, y: -4, width: 19, height: 62)
+            let ear = Path(roundedRect: rect, cornerRadius: 9.5).applying(tf)
+            c.fill(ear, with: .color(cream))
+            knit(c, ear, ear.boundingRect, shade.opacity(0.55))
+            c.stroke(ear, with: .color(shade.opacity(0.75)), lineWidth: 0.8)
+        }
+
+        // Feet, body, head.
+        for side in [-1.0, 1.0] {
+            let foot = Path(ellipseIn: CGRect(x: side * 13 - 10.5, y: -12, width: 21, height: 13))
+            c.fill(foot, with: .color(cream))
+            knit(c, foot, foot.boundingRect, shade.opacity(0.55))
+            c.stroke(foot, with: .color(shade.opacity(0.75)), lineWidth: 0.8)
+        }
+        let bodyRect = CGRect(x: -24, y: -46, width: 48, height: 42)
+        let body = Path(ellipseIn: bodyRect)
+        c.fill(body, with: .color(cream))
+        knit(c, body, bodyRect, shade.opacity(0.55))
+        c.stroke(body, with: .color(shade.opacity(0.75)), lineWidth: 0.8)
+        let headRect = CGRect(x: -29, y: -88, width: 58, height: 47)
+        let head = Path(ellipseIn: headRect)
+        c.fill(head, with: .color(cream))
+        knit(c, head, headRect, shade.opacity(0.55))
+        c.stroke(head, with: .color(shade.opacity(0.75)), lineWidth: 0.8)
+
+        // Little paws held at the chest, bouncing as she hops.
+        for side in [-1.0, 1.0] {
+            let py = -38 + sin(a.runPhase * .pi * 2 + (side > 0 ? 0 : .pi)) * 2.5 * stride
+            let pawRect = CGRect(x: side * 12 - 7.5, y: py - 8, width: 15, height: 16)
+            let paw = Path(ellipseIn: pawRect)
+            c.fill(paw, with: .color(cream))
+            knit(c, paw, pawRect, shade.opacity(0.6), spacing: 4)
+            c.stroke(paw, with: .color(shade.opacity(0.75)), lineWidth: 0.8)
+        }
+
+        // Bead eyes, set wide and low like the real one.
+        let ey = -60.0
+        for side in [-1.0, 1.0] {
+            let ex = side * 13.5
+            if offline {
+                var xp = Path()
+                xp.move(to: CGPoint(x: ex - 3, y: ey - 3)); xp.addLine(to: CGPoint(x: ex + 3, y: ey + 3))
+                xp.move(to: CGPoint(x: ex + 3, y: ey - 3)); xp.addLine(to: CGPoint(x: ex - 3, y: ey + 3))
+                c.stroke(xp, with: .color(ink), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+            } else if sleeping || a.blinking {
+                var lid = Path()
+                lid.addArc(center: CGPoint(x: ex, y: ey - 1.5), radius: 3.6, startAngle: .degrees(20), endAngle: .degrees(160), clockwise: false)
+                c.stroke(lid, with: .color(ink), style: StrokeStyle(lineWidth: 1.9, lineCap: .round))
+            } else if turbo {
+                var ch = Path()
+                ch.move(to: CGPoint(x: ex - side * 3.5, y: ey - 3.5))
+                ch.addLine(to: CGPoint(x: ex + side * 2.5, y: ey))
+                ch.addLine(to: CGPoint(x: ex - side * 3.5, y: ey + 3.5))
+                c.stroke(ch, with: .color(ink), style: StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
+            } else {
+                c.fill(Path(ellipseIn: CGRect(x: ex - 3.4, y: ey - 3.6, width: 6.8, height: 7.2)), with: .color(ink))
+                c.fill(Path(ellipseIn: CGRect(x: ex - 2, y: ey - 2.6, width: 2.2, height: 2.2)), with: .color(.white.opacity(0.9)))
+            }
+            c.fill(Path(ellipseIn: CGRect(x: ex + side * 3.5 - 4.5, y: ey + 5, width: 9, height: 4.5)),
+                   with: .color(pink.opacity(offline ? 0 : 0.18 + 0.5 * u)))
+        }
+        var mouth = Path()
+        switch mood {
+        case "working":
+            mouth.addArc(center: CGPoint(x: -1.8, y: ey + 5), radius: 1.8, startAngle: .degrees(0), endAngle: .degrees(180), clockwise: false)
+            mouth.addArc(center: CGPoint(x: 1.8, y: ey + 5), radius: 1.8, startAngle: .degrees(0), endAngle: .degrees(180), clockwise: false)
+            c.stroke(mouth, with: .color(ink.opacity(0.75)), style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
+        case "hustling", "turbo":
+            let r = mood == "turbo" ? 3.6 : 3
+            mouth.move(to: CGPoint(x: -r, y: ey + 4))
+            mouth.addArc(center: CGPoint(x: 0, y: ey + 4), radius: r, startAngle: .degrees(0), endAngle: .degrees(180), clockwise: false)
+            mouth.closeSubpath()
+            c.fill(mouth, with: .color(ink))
+            c.fill(Path(ellipseIn: CGRect(x: -r * 0.55, y: ey + 4 + r * 0.3, width: r * 1.1, height: r * 0.6)), with: .color(pink))
+        default:
+            break
+        }
+
+        // The witch hat: black cone, lavender band, wide brim. It lags behind each hop and droops when she naps.
+        let tilt = sleeping ? -0.34 : -0.12 + sin(a.runPhase * .pi * 2 - 0.8) * 0.1 * stride - (turbo ? 0.28 : 0)
+        var hc = c
+        hc.translateBy(x: 1, y: headRect.minY + 7)
+        hc.rotate(by: .radians(tilt))
+        hc.scaleBy(x: 1.12, y: 1.12)
+        let wobble = sleeping ? 0 : sin(t * 4 + 1) * 2.5 * stride
+        var cone = Path()
+        cone.move(to: CGPoint(x: -17, y: -6))
+        cone.addQuadCurve(to: CGPoint(x: 5 + wobble, y: -48), control: CGPoint(x: -9, y: -30))
+        cone.addQuadCurve(to: CGPoint(x: 17, y: -6), control: CGPoint(x: 10, y: -25))
+        cone.closeSubpath()
+        hc.fill(cone, with: .color(hatColor))
+        knit(hc, cone, cone.boundingRect, .white.opacity(0.16), spacing: 4)
+        let bandRect = CGRect(x: -17.5, y: -13, width: 35, height: 7.5)
+        let band = Path(roundedRect: bandRect, cornerRadius: 2)
+        hc.fill(band, with: .color(lavender))
+        knit(hc, band, bandRect, .black.opacity(0.18), spacing: 3.6)
+        let brimRect = CGRect(x: -27, y: -8, width: 54, height: 11)
+        let brim = Path(ellipseIn: brimRect)
+        hc.fill(brim, with: .color(hatColor))
+        knit(hc, brim, brimRect, .white.opacity(0.14), spacing: 4)
+
+        // Where the effects (sweat, Zzz, sparkles) attach, in scene coordinates.
+        return CGRect(x: cx - 29 * k, y: groundY - 2 - lift + headRect.minY * squash * k, width: 58 * k, height: headRect.height * squash * k)
+    }
+
+    // MARK: Photo characters: your cut-out, squashing, stretching and hopping.
+
+    private func drawPhoto(_ ctx: GraphicsContext, _ image: NSImage, cx: Double, groundY: Double, sleeping: Bool, offline: Bool) -> CGRect {
+        let a = anim, u = a.util, t = a.time
+        let stride = sleeping ? 0 : min(1, u * 2.5)
+        let turbo = mood == "turbo" && !sleeping
+        let ph = a.runPhase * .pi
+        let hop = abs(sin(ph)) * (3 + 10 * u) * stride
+        let landing = 1 - abs(sin(ph))
+        // Jelly: squash on landing, stretch in the air, breathe while napping.
+        let squash = sleeping ? 1 + 0.03 * sin(t * 1.6) : 1 - 0.1 * landing * stride + 0.05 * (1 - landing) * stride
+        let aspect = image.size.height > 0 ? image.size.width / image.size.height : 1
+        var hgt = 100.0
+        var wid = hgt * aspect
+        if wid > 120 {
+            wid = 120
+            hgt = wid / aspect
+        }
+
+        var c = ctx
+        c.translateBy(x: cx, y: groundY - 1 - hop)
+        c.rotate(by: .radians(sleeping ? -0.08 + 0.02 * sin(t * 1.6) : u * 0.1 + sin(a.runPhase * .pi * 2) * 0.05 * stride))
+        c.scaleBy(x: 2 - squash, y: squash)
+
+        if turbo {
+            let f = 0.75 + 0.25 * sin(t * 40) + 0.15 * sin(t * 23)
+            let outer = CGRect(x: -wid / 2 - 30 * f, y: -hgt * 0.45 - 9 * f, width: 34 * f, height: 18 * f)
+            c.drawLayer { l in
+                l.addFilter(.blur(radius: 3))
+                l.fill(Path(ellipseIn: outer), with: .color(.orange.opacity(0.85)))
+                l.fill(Path(ellipseIn: outer.insetBy(dx: 8 * f, dy: 4 * f).offsetBy(dx: 5, dy: 0)), with: .color(.yellow))
+            }
+        }
+        var pc = c
+        if offline { pc.addFilter(.grayscale(1)) }
+        if sleeping { pc.opacity = 0.9 }
+        pc.draw(pc.resolve(Image(nsImage: image)), in: CGRect(x: -wid / 2, y: -hgt, width: wid, height: hgt))
+
+        return CGRect(x: cx - wid / 2, y: groundY - 1 - hop - hgt * squash, width: wid, height: hgt * 0.5)
     }
 
     private func draw(_ ctx: inout GraphicsContext, _ size: CGSize) {
@@ -703,155 +1215,19 @@ struct SceneCanvas: View {
         let bob = sleeping ? sin(t * 1.6) * 1.5 : abs(sin(a.runPhase * .pi * 2)) * (2 + 5 * u)
         ctx.fill(Path(ellipseIn: CGRect(x: cx - 30 + bob, y: groundY - 3, width: 60 - bob * 2, height: 7)), with: .color(.black.opacity(0.25)))
 
-        var c = ctx
-        c.translateBy(x: cx, y: groundY)
-        c.rotate(by: .radians(sleeping ? 0 : u * 0.12))
-        c.translateBy(x: -cx, y: -groundY)
-
-        let bw = 64.0, bh = 54.0
-        let bodyBottom = groundY - 11 - bob
-        let body = CGRect(x: cx - bw / 2, y: bodyBottom - bh, width: bw, height: bh)
-        let gold = Color(red: 1, green: 0.8, blue: 0.45)
-        let shell1 = Color(red: 0.98, green: 0.96, blue: 1)
-        let shell2 = Color(red: 0.8, green: 0.78, blue: 0.97)
-        let pink = Color(red: 1, green: 0.55, blue: 0.7)
-
-        // Turbo rocket flames.
-        if u > 0.82 && !sleeping {
-            let f = 0.75 + 0.25 * sin(t * 40) + 0.15 * sin(t * 23)
-            let outer = CGRect(x: body.minX - 4 - 30 * f, y: body.midY + 6 - 9 * f, width: 34 * f, height: 18 * f)
-            c.drawLayer { l in
-                l.addFilter(.blur(radius: 3))
-                l.fill(Path(ellipseIn: outer), with: .color(.orange.opacity(0.85)))
-                l.fill(Path(ellipseIn: outer.insetBy(dx: 8 * f, dy: 4 * f).offsetBy(dx: 5, dy: 0)), with: .color(.yellow))
-            }
+        let c: GraphicsContext
+        let body: CGRect
+        switch character {
+        case .chippy:
+            (c, body) = drawChippy(ctx, cx: cx, groundY: groundY, bob: bob, sleeping: sleeping, offline: offline)
+        case .bunny:
+            (c, body) = (ctx, drawBunny(ctx, cx: cx, groundY: groundY, sleeping: sleeping, offline: offline))
+        case .photo(let image):
+            (c, body) = (ctx, drawPhoto(ctx, image, cx: cx, groundY: groundY, sleeping: sleeping, offline: offline))
         }
-
-        // USB-cable tail, wagging faster with load.
-        let wag = sin(t * (2 + u * 10)) * (sleeping ? 2 : 7)
-        var tail = Path()
-        let tailStart = CGPoint(x: body.minX + 4, y: body.maxY - 12)
-        tail.move(to: tailStart)
-        let tailEnd = CGPoint(x: tailStart.x - 22, y: tailStart.y - 16 + wag)
-        tail.addCurve(to: tailEnd, control1: CGPoint(x: tailStart.x - 14, y: tailStart.y + 6), control2: CGPoint(x: tailEnd.x + 4, y: tailEnd.y + 14))
-        c.stroke(tail, with: .color(Color(white: 0.35)), style: StrokeStyle(lineWidth: 3, lineCap: .round))
-        c.fill(Path(roundedRect: CGRect(x: tailEnd.x - 4, y: tailEnd.y - 7, width: 8, height: 9), cornerRadius: 2), with: .color(Color(white: 0.75)))
-
-        // Stubby pin legs.
-        let stride = sleeping ? 0 : min(1, u * 2)
-        for i in 0..<2 {
-            let ph = a.runPhase * .pi * 2 + Double(i) * .pi
-            let hip = CGPoint(x: cx + (i == 0 ? -13 : 13), y: bodyBottom - 2)
-            let foot = CGPoint(x: hip.x + sin(ph) * 9 * stride, y: groundY - 3 - max(0, cos(ph)) * 6 * stride)
-            var leg = Path()
-            leg.move(to: hip)
-            leg.addLine(to: foot)
-            c.stroke(leg, with: .color(gold), style: StrokeStyle(lineWidth: 4, lineCap: .round))
-            c.fill(Path(ellipseIn: CGRect(x: foot.x - 6, y: foot.y - 3, width: 12, height: 6)), with: .color(Color(red: 0.98, green: 0.7, blue: 0.8)))
-        }
-
-        // Little arm pins.
-        for side in [-1.0, 1.0] {
-            let swing = sin(a.runPhase * .pi * 2 + (side > 0 ? 0 : .pi)) * 5 * stride
-            let px = side < 0 ? body.minX - 6 : body.maxX - 1
-            c.fill(Path(roundedRect: CGRect(x: px, y: body.midY + 2 + swing - 2.5, width: 7, height: 5), cornerRadius: 2.5), with: .color(gold))
-        }
-
-        // Kitty ears.
-        for side in [-1.0, 1.0] {
-            let ex = cx + side * 20
-            var ear = Path()
-            ear.move(to: CGPoint(x: ex - 9, y: body.minY + 6))
-            ear.addQuadCurve(to: CGPoint(x: ex + side * 3, y: body.minY - 12 - (sleeping ? 0 : sin(t * 3) * u * 2)), control: CGPoint(x: ex - 7, y: body.minY - 6))
-            ear.addQuadCurve(to: CGPoint(x: ex + 9, y: body.minY + 6), control: CGPoint(x: ex + 7, y: body.minY - 6))
-            c.fill(ear, with: .color(shell2))
-            var inner = Path()
-            inner.move(to: CGPoint(x: ex - 4.5, y: body.minY + 4))
-            inner.addQuadCurve(to: CGPoint(x: ex + side * 2, y: body.minY - 6), control: CGPoint(x: ex - 3.5, y: body.minY - 2))
-            inner.addQuadCurve(to: CGPoint(x: ex + 4.5, y: body.minY + 4), control: CGPoint(x: ex + 3.5, y: body.minY - 2))
-            c.fill(inner, with: .color(pink.opacity(0.75)))
-        }
-
-        // Chubby body.
-        let bodyPath = Path(roundedRect: body, cornerRadius: 22)
-        c.fill(bodyPath, with: .linearGradient(Gradient(colors: [shell1, shell2]),
-                                               startPoint: CGPoint(x: body.minX, y: body.minY), endPoint: CGPoint(x: body.maxX, y: body.maxY)))
-        c.fill(Path(ellipseIn: CGRect(x: body.minX + 9, y: body.minY + 5, width: 16, height: 7)), with: .color(.white.opacity(0.9)))
-
-        // Propeller beanie between the ears.
-        var stem = Path()
-        stem.move(to: CGPoint(x: cx, y: body.minY + 1))
-        stem.addLine(to: CGPoint(x: cx, y: body.minY - 7))
-        c.stroke(stem, with: .color(Color(white: 0.5)), lineWidth: 2)
-        let blade = abs(cos(a.fanPhase)) * 12 + 2
-        c.fill(Path(ellipseIn: CGRect(x: cx - blade, y: body.minY - 10, width: blade * 2, height: 4.5)),
-               with: .color(Color(hue: a.hue, saturation: 0.45, brightness: 1).opacity(u > 0.6 ? 0.75 : 1)))
-        c.fill(Path(ellipseIn: CGRect(x: cx - 2.5, y: body.minY - 10, width: 5, height: 5)), with: .color(pink))
-
-        // Face.
-        let ink = Color(red: 0.2, green: 0.17, blue: 0.32)
-        let ey = body.minY + 22
-        for side in [-1.0, 1.0] {
-            let ex = cx + side * 12
-            if offline {
-                var xp = Path()
-                xp.move(to: CGPoint(x: ex - 3.5, y: ey - 3.5)); xp.addLine(to: CGPoint(x: ex + 3.5, y: ey + 3.5))
-                xp.move(to: CGPoint(x: ex + 3.5, y: ey - 3.5)); xp.addLine(to: CGPoint(x: ex - 3.5, y: ey + 3.5))
-                c.stroke(xp, with: .color(ink), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
-            } else if sleeping {
-                var arc = Path()
-                arc.addArc(center: CGPoint(x: ex, y: ey - 1), radius: 4.5, startAngle: .degrees(20), endAngle: .degrees(160), clockwise: false)
-                c.stroke(arc, with: .color(ink), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
-            } else if mood == "turbo" {
-                var ch = Path()
-                ch.move(to: CGPoint(x: ex - side * 4, y: ey - 4.5))
-                ch.addLine(to: CGPoint(x: ex + side * 3, y: ey))
-                ch.addLine(to: CGPoint(x: ex - side * 4, y: ey + 4.5))
-                c.stroke(ch, with: .color(ink), style: StrokeStyle(lineWidth: 2.6, lineCap: .round, lineJoin: .round))
-            } else if a.blinking {
-                var lid = Path()
-                lid.move(to: CGPoint(x: ex - 4.5, y: ey)); lid.addLine(to: CGPoint(x: ex + 4.5, y: ey))
-                c.stroke(lid, with: .color(ink), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
-            } else {
-                // Big sparkly anime eyes.
-                c.fill(Path(ellipseIn: CGRect(x: ex - 5, y: ey - 6.5, width: 10, height: 13)), with: .color(ink))
-                c.fill(Path(ellipseIn: CGRect(x: ex - 3, y: ey - 4.5, width: 4.2, height: 4.2)), with: .color(.white))
-                c.fill(Path(ellipseIn: CGRect(x: ex + 1, y: ey + 1.5, width: 2, height: 2)), with: .color(.white.opacity(0.9)))
-                if mood == "hustling" {
-                    var brow = Path()
-                    brow.move(to: CGPoint(x: ex - side * 5, y: ey - 11))
-                    brow.addLine(to: CGPoint(x: ex + side * 4, y: ey - 9))
-                    c.stroke(brow, with: .color(ink), style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
-                }
-            }
-            c.fill(Path(ellipseIn: CGRect(x: ex + side * 5 - 5, y: ey + 6, width: 10, height: 5)),
-                   with: .color(pink.opacity(offline ? 0 : 0.35 + 0.5 * u)))
-        }
-
-        let my = ey + 10
-        var mouth = Path()
-        switch mood {
-        case "offline":
-            mouth.addArc(center: CGPoint(x: cx, y: my + 3), radius: 3.5, startAngle: .degrees(200), endAngle: .degrees(340), clockwise: false)
-            c.stroke(mouth, with: .color(ink), style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
-        case "sleeping":
-            c.fill(Path(ellipseIn: CGRect(x: cx - 1.8, y: my - 1, width: 3.6, height: 3 + sin(t * 1.6))), with: .color(ink))
-        case "chill", "working":
-            // Cat mouth: ω
-            mouth.addArc(center: CGPoint(x: cx - 2.6, y: my - 1.5), radius: 2.6, startAngle: .degrees(0), endAngle: .degrees(180), clockwise: false)
-            mouth.addArc(center: CGPoint(x: cx + 2.6, y: my - 1.5), radius: 2.6, startAngle: .degrees(0), endAngle: .degrees(180), clockwise: false)
-            c.stroke(mouth, with: .color(ink), style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
-        default:  // hustling / turbo: open grin with a tongue
-            let r = mood == "turbo" ? 5.5 : 4.5
-            mouth.move(to: CGPoint(x: cx - r, y: my - 2))
-            mouth.addArc(center: CGPoint(x: cx, y: my - 2), radius: r, startAngle: .degrees(0), endAngle: .degrees(180), clockwise: false)
-            mouth.closeSubpath()
-            c.fill(mouth, with: .color(ink))
-            c.fill(Path(ellipseIn: CGRect(x: cx - r * 0.55, y: my + r * 0.25 - 2, width: r * 1.1, height: r * 0.7)), with: .color(pink))
-        }
-
-        // Tiny gold chip badge on the tummy.
-        c.fill(Path(roundedRect: CGRect(x: cx - 6, y: body.maxY - 12, width: 12, height: 7), cornerRadius: 2), with: .color(gold.opacity(0.85)))
+        // Sparkles rise from above the head (and above the bunny's hat).
+        var sparkleTop = body.minY - 8
+        if case .bunny = character { sparkleTop -= 22 }
 
         // Sweat drops.
         if u > 0.6 && !sleeping {
@@ -879,7 +1255,7 @@ struct SceneCanvas: View {
         // Hearts and stars (or AI glyphs) floating off the work.
         for p in a.particles {
             let o = max(0, p.life / p.maxLife)
-            let pos = CGPoint(x: cx + p.x, y: body.minY - 8 + p.y)
+            let pos = CGPoint(x: cx + p.x, y: sparkleTop + p.y)
             let col = Color(hue: p.hue, saturation: 0.45, brightness: 1).opacity(o)
             if let g = p.glyph {
                 ctx.draw(Text(g).font(.system(size: 6 + p.size * 1.5, weight: .bold, design: .rounded)).foregroundColor(col), at: pos)
@@ -1471,14 +1847,16 @@ let moodLabel = ["sleeping": "NAPPING", "chill": "CHILLING", "working": "WORKING
 
 struct RootView: View {
     @ObservedObject var fleet: Fleet
+    @ObservedObject var characters: Characters
     let anim: Anim
 
-    var body: some View { ContentView(store: fleet.current, fleet: fleet, anim: anim) }
+    var body: some View { ContentView(store: fleet.current, fleet: fleet, characters: characters, anim: anim) }
 }
 
 struct ContentView: View {
     @ObservedObject var store: GPUStore
     @ObservedObject var fleet: Fleet
+    @ObservedObject var characters: Characters
     var anim = Anim()
 
     var body: some View {
@@ -1502,6 +1880,28 @@ struct ContentView: View {
 
     private var moodColor: Color { Color(hue: anim.hue, saturation: 0.45, brightness: 1) }
 
+    private var characterMenu: some View {
+        Menu {
+            ForEach(characters.all) { ch in
+                Button((ch.id == characters.selected ? "✓ " : "") + ch.name) { characters.selected = ch.id }
+            }
+            Divider()
+            Button("Add Character from Photo…") { characters.addFromPanel() }
+            if characters.currentIsPhoto {
+                Button("Remove \(characters.currentName)") { characters.remove(characters.selected) }
+            }
+        } label: {
+            Image(systemName: characters.busy ? "hourglass" : "theatermasks.fill")
+                .font(.system(size: 9, weight: .bold))
+                .frame(width: 18, height: 18)
+                .background(Circle().fill(.white.opacity(0.16)))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Change character (⌘J)")
+    }
+
     private func modeButton(_ symbol: String) -> some View {
         Button { fleet.compact.toggle() } label: {
             Image(systemName: symbol)
@@ -1516,11 +1916,17 @@ struct ContentView: View {
     // Full window: Chippy, stats, processes, hype and the 24h timeline.
     private func full(_ s: Snapshot?) -> some View {
         VStack(spacing: 8) {
-            SceneCanvas(anim: anim, mood: store.mood, badge: badge)
+            SceneCanvas(anim: anim, mood: store.mood, badge: badge, character: characters.current)
                 .frame(height: 150)
                 .clipped()
                 .overlay(WindowDragArea())
-                .overlay(alignment: .topTrailing) { modeButton("rectangle.compress.vertical").padding(8) }
+                .overlay(alignment: .topTrailing) {
+                    HStack(spacing: 5) {
+                        characterMenu
+                        modeButton("rectangle.compress.vertical")
+                    }
+                    .padding(8)
+                }
 
             VStack(spacing: 8) {
                 HostBar(fleet: fleet)
@@ -1584,7 +1990,7 @@ struct ContentView: View {
     // Compact strip: mini Chippy + the essentials.
     private func compact(_ s: Snapshot?) -> some View {
         HStack(spacing: 10) {
-            SceneCanvas(anim: anim, mood: store.mood)
+            SceneCanvas(anim: anim, mood: store.mood, character: characters.current)
                 .frame(width: 92, height: 78)
                 .clipShape(RoundedRectangle(cornerRadius: 14))
                 .overlay(WindowDragArea())
@@ -2541,6 +2947,7 @@ struct LedgerView: View {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
     var window: NSWindow!
     var fleet: Fleet!
+    let characters = Characters()
     var ledgerWindow: NSWindow?
     var macsWindow: NSWindow?
     private var port = 8765
@@ -2566,7 +2973,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.isMovableByWindowBackground = false  // drag via Chippy's scene; lets the timeline scrub
         window.backgroundColor = NSColor(red: 0.1, green: 0.09, blue: 0.15, alpha: 1)
         window.appearance = NSAppearance(named: .darkAqua)
-        window.contentView = NSHostingView(rootView: RootView(fleet: fleet, anim: Anim()))
+        window.contentView = NSHostingView(rootView: RootView(fleet: fleet, characters: characters, anim: Anim()))
         window.delegate = self
         window.setFrameAutosaveName("GPUBuddyWindow")
         let restored = window.setFrameUsingName("GPUBuddyWindow")
@@ -2657,7 +3064,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         appMenu.addItem(ledger)
         appMenu.addItem(.separator())
         for (title, action, key) in [("Macs…", #selector(openMacs), "k"), ("Next Mac", #selector(nextMac), "]"),
-                                     ("Previous Mac", #selector(previousMac), "[")] {
+                                     ("Previous Mac", #selector(previousMac), "["), ("Next Character", #selector(nextCharacter), "j"),
+                                     ("Add Character from Photo…", #selector(addCharacter), "")] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
             item.target = self
             appMenu.addItem(item)
@@ -2732,6 +3140,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc func nextMac() { fleet.step(1) }
+    @objc func nextCharacter() { characters.next() }
+    @objc func addCharacter() { characters.addFromPanel() }
     @objc func previousMac() { fleet.step(-1) }
 
     /// Resize to the SwiftUI content, keeping the window's top edge in place.
