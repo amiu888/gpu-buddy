@@ -32,6 +32,7 @@ open "app/GPU Buddy.app"
 | `GET /api/v1/usage?preset=today\|week\|month\|ytd\|total` | token usage for a period: totals, a series and a per-model breakdown |
 | `GET /api/v1/usage?from=<unix>&to=<unix>&group=hour\|day\|month` | the same for any date range |
 | `GET /api/v1/usage/summary` | token totals for today, this week, this month, YTD and all time |
+| `GET /api/v1/cost?preset=today&cache_hit=0.5&batch=1` | what the period's tokens would cost on frontier cloud models |
 | `GET /api/v1/power` | chip power right now (GPU, CPU, Neural Engine, memory) and joules per token |
 | `GET /api/v1/stream` | Server-Sent Events, one snapshot per second |
 | `GET /api/v1/pairing` | this Mac's pairing code (only from this Mac, over 127.0.0.1) |
@@ -68,6 +69,20 @@ gpud reads the chip's own energy counters (IOReport, the same source as `powerme
 | energy per model | GPU energy is assigned to the models that produced the tokens, kept forever per hour |
 
 The Token Ledger shows GPU and whole-chip energy for any period, the energy that went into tokens, what the chip's electricity cost (set your price per kWh), and what the same tokens would cost on the Claude API at list prices. The whole Mac at the wall uses more than the chip: fans, SSD, display and power-supply losses aren't included.
+
+## What would the cloud cost?
+
+The Token Ledger estimates what the same tokens would have cost on frontier cloud models: Claude (Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5), OpenAI (GPT-6 Astra, GPT-5.5, GPT-6.1 Sol, GPT-6 Luna) and Google (Gemini 4 Argon, 3.1 Pro, 3.8 Flash). It shows the cost for the period, a 30-day projection at that pace, and how much running locally saved compared with your chip's electricity.
+
+How it estimates:
+
+- **Prompt tokens are priced as input** and **generated tokens as output**, at each model's list price.
+- **Prompt cache hits** (default 0%, the worst case): this share of prompt tokens is billed at the much cheaper cached-input price. One in ten of those first pays the cache-write price.
+- **Hidden thinking**: extra output tokens a cloud reasoning model spends before answering.
+- **Tokenizer**: scales all counts, because each model family turns the same text into a different number of tokens.
+- **Batch API**: 50% off, for work nobody waits on.
+
+Prices are in `daemon/prices.json` with their date and sources. To change them, copy that file to `~/Library/Application Support/GPUBuddy/prices.json` and edit the copy. The API is `GET /api/v1/cost?preset=month&cache_hit=0.5&batch=1`.
 
 ## Watching other Macs
 

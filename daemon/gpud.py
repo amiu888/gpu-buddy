@@ -15,6 +15,9 @@ serves them over a local HTTP API:
                               or ?from=<unix>&to=<unix>, &group=hour|day|month)
   GET /api/v1/usage/summary -> token totals for today, this week, this month, YTD and all time
   GET /api/v1/power        -> chip power right now (GPU, CPU, ANE, DRAM) and energy per token
+  GET /api/v1/cost         -> what the period's tokens would cost on frontier cloud models
+                              (?preset=… or ?from=&to=, &cache_hit=0..0.95, &batch=1,
+                              &thinking=0..3, &tokenizer=0.5..2)
 
 Power comes from IOReport's energy counters via the small gpupower helper (compiled from
 gpupower.c on first run; no sudo). GPU energy spent while a local LLM server works is assigned to
@@ -54,7 +57,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 RETENTION_SECONDS = 24 * 3600
 STATE_DIR = os.path.expanduser("~/Library/Application Support/GPUBuddy")
 DEFAULT_DB = os.path.join(STATE_DIR, "history.db")
@@ -1105,6 +1108,56 @@ class DualStackServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
+def load_prices():
+    """Frontier model prices: the user's copy in STATE_DIR if there is one, else the one shipped with gpud."""
+    for path in (os.path.join(STATE_DIR, "prices.json"),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "prices.json")):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            continue
+    return {"models": []}
+
+
+def cloud_cost(usage, cache_hit=0.0, batch=False, thinking=0.0, tokenizer=1.0, reuse=10.0):
+    """What the tokens in a usage() result would cost on each frontier cloud model.
+
+    - Prompt tokens ("used") are input; a share `cache_hit` of them is read from the provider's prompt
+      cache at the cache-read price. Each cached prefix has to be written once first, so 1/`reuse` of
+      the cached tokens pay the cache-write price instead.
+    - Generated tokens are output. `thinking` adds hidden reasoning tokens as a share of the visible
+      output (cloud reasoning models bill it as output; local servers usually count it already).
+    - `tokenizer` scales every count: the same text is a different number of tokens per model family.
+    - Batch takes the provider's batch multiplier off everything.
+    """
+    prices = load_prices()
+    p = usage["prompt"] * tokenizer
+    g = usage["generated"] * tokenizer * (1 + thinking)
+    cached = p * cache_hit
+    written = cached / max(reuse, 1)
+    uncached = p - cached
+    now = time.time()
+    start = max(usage["from"], usage.get("first_recorded") or usage["from"])
+    days = max((min(usage["to"], now) - start) / 86400, 1 / 24)
+    rows = []
+    for m in prices.get("models", []):
+        cost = (uncached * m["input"] + (cached - written) * m["cache_read"] + written * m["cache_write"]
+                + g * m["output"]) / 1e6
+        if batch:
+            cost *= m.get("batch", 1.0)
+        rows.append({"provider": m["provider"], "model": m["model"], "cost": round(cost, 4),
+                     "per_day": round(cost / days, 4), "per_month": round(cost / days * 30, 2),
+                     "input": m["input"], "cache_read": m["cache_read"], "output": m["output"],
+                     "note": m.get("note")})
+    rows.sort(key=lambda r: r["cost"], reverse=True)
+    return {"as_of": prices.get("as_of"), "sources": prices.get("sources", []), "days": round(days, 3),
+            "tokens": {"prompt": usage["prompt"], "generated": usage["generated"]},
+            "assumptions": {"cache_hit": cache_hit, "batch": batch, "thinking": thinking, "tokenizer": tokenizer,
+                            "cache_reuse": reuse},
+            "models": rows}
+
+
 def make_handler(sampler, identity=None, remote=False):
     """remote=True: the TLS listener for other Macs, where every request needs the token."""
     class Handler(BaseHTTPRequestHandler):
@@ -1194,6 +1247,23 @@ def make_handler(sampler, identity=None, remote=False):
                 except (KeyError, ValueError):
                     return self._json({"error": "pass ?preset=today|week|month|ytd|total or ?from=&to= (unix)"}, 400)
                 return self._json(sampler.db.usage(start, end, q.get("group", [None])[0]))
+            if url.path == "/api/v1/cost":
+                try:
+                    if "preset" in q:
+                        start, end = period(q["preset"][0], int(q.get("week_start", ["2"])[0]))
+                    else:
+                        start = float(q.get("from", ["0"])[0])
+                        end = float(q.get("to", [str(time.time() + 3600)])[0])
+                    num = lambda k, d, lo, hi: min(max(float(q.get(k, [d])[0]), lo), hi)
+                    opts = {"cache_hit": num("cache_hit", 0, 0, 0.95), "batch": q.get("batch", ["0"])[0] in ("1", "true"),
+                            "thinking": num("thinking", 0, 0, 3), "tokenizer": num("tokenizer", 1, 0.5, 2)}
+                except (KeyError, ValueError):
+                    return self._json({"error": "pass ?preset=… or ?from=&to=, plus optional cache_hit, batch, thinking, tokenizer"}, 400)
+                usage = sampler.db.usage(start, end, "year")
+                out = cloud_cost(usage, **opts)
+                e = usage["energy"]
+                out["local"] = {"chip_j": e["soc_j"], "ai_j": e["ai_j"]}
+                return self._json(out)
             if url.path == "/api/v1/usage/summary":
                 try:
                     ws = int(q.get("week_start", ["2"])[0])

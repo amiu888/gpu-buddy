@@ -1761,13 +1761,11 @@ func energyText(_ joules: Double) -> String {
     return String(format: "%.0f J", joules)
 }
 
-/// What these tokens would cost on the Claude API at list prices ($ per 1M input, output), no caching.
-let cloudPrices: [(name: String, input: Double, output: Double)] = [
-    ("Opus 5.5", 4, 20), ("Sonnet 5.5", 2, 10), ("Haiku 5.5", 0.10, 0.50),
-]
-
 func moneyText(_ v: Double) -> String {
-    v >= 100 ? String(format: "$%.0f", v) : v >= 1 ? String(format: "$%.2f", v) : v >= 0.01 ? String(format: "$%.2f", v) : v > 0 ? "<$0.01" : "$0"
+    if v >= 10_000 { return "$" + fullCount(v.rounded()) }
+    if v >= 100 { return String(format: "$%.0f", v) }
+    if v >= 0.01 { return String(format: "$%.2f", v) }
+    return v > 0 ? "<$0.01" : "$0"
 }
 
 /// 1234 -> "1.2K", 3_400_000 -> "3.4M"
@@ -2466,6 +2464,26 @@ struct Usage: Decodable {
     let energy: Energy?
 }
 
+/// What a period's tokens would cost on frontier cloud models (from gpud's /api/v1/cost).
+struct CloudCost: Decodable {
+    struct Row: Decodable, Identifiable {
+        let provider: String
+        let model: String
+        let cost: Double
+        let per_day: Double
+        let per_month: Double
+        let input: Double
+        let cache_read: Double
+        let output: Double
+        let note: String?
+        var id: String { provider + model }
+    }
+    let as_of: String?
+    let sources: [String]
+    let days: Double
+    let models: [Row]
+}
+
 struct UsageSummary: Decodable {
     struct Totals: Decodable {
         let generated: Double
@@ -2508,6 +2526,12 @@ final class Ledger: ObservableObject {
     @Published var monthOf = Date() { didSet { refresh() } }
     @Published var from = Calendar.current.date(byAdding: .day, value: -6, to: Date())! { didSet { refresh() } }
     @Published var to = Date() { didSet { refresh() } }
+    // Assumptions for the cloud estimate, remembered between launches.
+    @Published var cacheHit = UserDefaults.standard.double(forKey: "cost.cacheHit") { didSet { saveCostOptions() } }
+    @Published var batch = UserDefaults.standard.bool(forKey: "cost.batch") { didSet { saveCostOptions() } }
+    @Published var thinking = UserDefaults.standard.double(forKey: "cost.thinking") { didSet { saveCostOptions() } }
+    @Published var tokenizer = UserDefaults.standard.object(forKey: "cost.tokenizer") as? Double ?? 1 { didSet { saveCostOptions() } }
+    @Published private(set) var cloud: CloudCost?
     @Published private(set) var usage: Usage?
     @Published private(set) var summary: UsageSummary?
     @Published private(set) var online = true
@@ -2579,19 +2603,33 @@ final class Ledger: ObservableObject {
     func shiftMonth(_ n: Int) { monthOf = cal.date(byAdding: .month, value: n, to: monthOf)! }
     func shiftDay(_ n: Int) { day = cal.date(byAdding: .day, value: n, to: day)! }
 
+    private func saveCostOptions() {
+        let d = UserDefaults.standard
+        d.set(cacheHit, forKey: "cost.cacheHit")
+        d.set(batch, forKey: "cost.batch")
+        d.set(thinking, forKey: "cost.thinking")
+        d.set(tokenizer, forKey: "cost.tokenizer")
+        refresh()
+    }
+
     func refresh() {
         let (start, end, group) = period
         var path = "/api/v1/usage?from=\(Int(start.timeIntervalSince1970))&to=\(Int(end.timeIntervalSince1970))"
         if let group { path += "&group=\(group)" }
+        let costPath = "/api/v1/cost?from=\(Int(start.timeIntervalSince1970))&to=\(Int(end.timeIntervalSince1970))"
+            + String(format: "&cache_hit=%.2f&thinking=%.2f&tokenizer=%.2f", cacheHit, thinking, tokenizer)
+            + (batch ? "&batch=1" : "")
         task?.cancel()
         task = Task { [path] in
             async let u: Usage? = client.get(path, timeout: 3)
             async let s: UsageSummary? = client.get("/api/v1/usage/summary?week_start=\(cal.firstWeekday)", timeout: 3)
-            let (usage, summary) = await (u, s)
+            async let c: CloudCost? = client.get(costPath, timeout: 3)
+            let (usage, summary, cloud) = await (u, s, c)
             guard !Task.isCancelled else { return }
             online = usage != nil
             if let usage { self.usage = usage }
             if let summary { self.summary = summary }
+            if let cloud { self.cloud = cloud }
         }
     }
 }
@@ -2613,6 +2651,16 @@ struct LedgerView: View {
     private let ground = Color(red: 0.1, green: 0.09, blue: 0.15)
 
     var body: some View {
+        ScrollView(.vertical) {
+            content
+        }
+        .frame(width: 380)
+        .frame(minHeight: 560)
+        .background(ground)
+        .ignoresSafeArea()
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 Text("📒 Token Ledger").font(.system(size: 17, weight: .heavy, design: .rounded))
@@ -2633,15 +2681,13 @@ struct LedgerView: View {
 
             totals
             energy
+            cloudCost
             chart
             models
         }
         .padding(.horizontal, 16).padding(.bottom, 14)
-        .frame(width: 380)
-        .frame(minHeight: 560, alignment: .top)
+        .frame(width: 380, alignment: .top)
         .foregroundColor(.white)
-        .background(ground)
-        .ignoresSafeArea()
     }
 
     private var presets: some View {
@@ -2750,15 +2796,6 @@ struct LedgerView: View {
                 tile("💡 ELECTRICITY", measured ? e.map { moneyText($0.soc_j / 3.6e6 * kwhPrice) } : nil,
                      "chip, at $\(String(format: "%.2f", kwhPrice))/kWh", orange)
             }
-            if let u, u.total > 0 {
-                let cloud = cloudPrices.map { "\($0.name) \(moneyText(u.prompt / 1e6 * $0.input + u.generated / 1e6 * $0.output))" }
-                Text("☁️ On the Claude API these tokens would cost " + cloud.joined(separator: " · "))
-                    .font(.system(size: 10, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.75))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .help("List prices per million tokens (input / output): "
-                          + cloudPrices.map { "\($0.name) $\(String(format: "%g", $0.input)) / $\(String(format: "%g", $0.output))" }.joined(separator: ", ")
-                          + ". Prompt caching and the Batch API would lower these. Haiku's price is for prompts under 100K tokens.")
-            }
             HStack(spacing: 4) {
                 Text("Electricity price $").font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.5))
                 TextField("", value: $kwhPrice, format: .number.precision(.fractionLength(2)))
@@ -2769,6 +2806,93 @@ struct LedgerView: View {
                     .lineLimit(1).minimumScaleFactor(0.8)
             }
         }
+    }
+
+    // What the same tokens would have cost on frontier cloud models, under adjustable assumptions.
+    private var cloudCost: some View {
+        let rows = ledger.cloud?.models ?? []
+        let localCost = (ledger.usage?.energy?.soc_j ?? 0) / 3.6e6 * kwhPrice
+        let days = ledger.cloud?.days ?? 1
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("☁️ IF THESE TOKENS RAN IN THE CLOUD").font(.system(size: 9.5, weight: .black, design: .rounded))
+                    .foregroundColor(.white.opacity(0.6))
+                Spacer()
+                Text("prices \(ledger.cloud?.as_of ?? "")").font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundColor(.white.opacity(0.4))
+                    .help("List prices per 1M tokens from:\n" + (ledger.cloud?.sources ?? []).joined(separator: "\n")
+                          + "\n\nEdit them in ~/Library/Application Support/GPUBuddy/prices.json (copy daemon/prices.json there).")
+            }
+            costSlider("Prompt cache hits", value: $ledger.cacheHit, range: 0...0.9, text: "\(Int(ledger.cacheHit * 100))%",
+                       help: "Share of prompt tokens the provider serves from its prompt cache (billed at ~5–10% of the input price). "
+                           + "0% is the worst case. Repeated system prompts and long chats often cache 50–90%; one-off prompts and images don't cache.")
+            costSlider("Hidden thinking", value: $ledger.thinking, range: 0...2, text: "+\(Int(ledger.thinking * 100))%",
+                       help: "Extra output tokens a cloud reasoning model spends thinking before it answers, as a share of the visible output. "
+                           + "Billed as output. 0% if your local count already includes reasoning or the task needs none.")
+            costSlider("Tokenizer", value: $ledger.tokenizer, range: 0.8...1.4, text: String(format: "%.2f×", ledger.tokenizer),
+                       help: "The same text is a different number of tokens on each model family. 1.00× uses your local model's counts; "
+                           + "newer Claude tokenizers can count up to ~1.35× more.")
+            Toggle(isOn: $ledger.batch) {
+                Text("Batch API (50% off, results within 24h: fine for work nobody waits on)")
+                    .font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.7))
+            }
+            .toggleStyle(.checkbox)
+
+            if rows.isEmpty {
+                Text(ledger.online ? "No tokens in this period." : "gpud offline").font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundColor(.white.opacity(0.5))
+            } else {
+                HStack {
+                    Text("MODEL").frame(maxWidth: .infinity, alignment: .leading)
+                    Text("THIS PERIOD").frame(width: 70, alignment: .trailing)
+                    Text(days >= 28 ? "PER DAY" : "≈ 30 DAYS").frame(width: 66, alignment: .trailing)
+                }
+                .font(.system(size: 8, weight: .black, design: .rounded)).foregroundColor(.white.opacity(0.45))
+                ForEach(rows) { r in
+                    HStack {
+                        Text(r.provider).foregroundColor(.white.opacity(0.45)).frame(width: 56, alignment: .leading)
+                        Text(r.model).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                        Text(moneyText(r.cost)).foregroundColor(gold).frame(width: 70, alignment: .trailing)
+                        Text(moneyText(days >= 28 ? r.per_day : r.per_month)).foregroundColor(.white.opacity(0.6))
+                            .frame(width: 66, alignment: .trailing)
+                    }
+                    .font(.system(size: 10, weight: .semibold, design: .rounded)).monospacedDigit()
+                    .help(String(format: "%@ %@: $%g in · $%g cached in · $%g out per 1M tokens", r.provider, r.model, r.input, r.cache_read, r.output)
+                          + (r.note.map { "\n\($0)" } ?? ""))
+                }
+                Divider().overlay(Color.white.opacity(0.1))
+                HStack {
+                    Text("🖥 Your Mac (chip electricity)").frame(maxWidth: .infinity, alignment: .leading)
+                    Text(moneyText(localCost)).foregroundColor(orange).frame(width: 70, alignment: .trailing)
+                    Text(moneyText(days >= 28 ? localCost / days : localCost / days * 30)).foregroundColor(.white.opacity(0.6))
+                        .frame(width: 66, alignment: .trailing)
+                }
+                .font(.system(size: 10, weight: .bold, design: .rounded)).monospacedDigit()
+                if let mid = rows.first(where: { $0.model.contains("Sonnet") }) ?? rows.dropFirst(rows.count / 2).first {
+                    Text("💰 Running locally saved about \(moneyText(max(0, mid.cost - localCost))) vs \(mid.model) in this period"
+                         + (days < 28 ? " (≈ \(moneyText(max(0, mid.per_month - localCost / days * 30))) a month at this pace)." : "."))
+                        .font(.system(size: 10.5, weight: .bold, design: .rounded)).foregroundColor(gold)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("Estimate: your prompt tokens priced as input and generated tokens as output, at list prices. "
+                     + "Long prompts (over 100K–272K tokens each) cost more on some models; yours are usually far below that. "
+                     + "≈ 30 days projects the pace of this period.")
+                    .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.45))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 12).fill(.white.opacity(0.05)))
+    }
+
+    private func costSlider(_ title: String, value: Binding<Double>, range: ClosedRange<Double>, text: String, help: String) -> some View {
+        HStack(spacing: 6) {
+            Text(title).frame(width: 100, alignment: .leading)
+            Slider(value: value, in: range).controlSize(.mini)
+            Text(text).monospacedDigit().frame(width: 40, alignment: .trailing)
+        }
+        .font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.7))
+        .help(help)
     }
 
     private func tile(_ title: String, _ value: String?, _ sub: String, _ color: Color) -> some View {
@@ -3086,18 +3210,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc func openLedger() {
         if ledgerWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 560),
-                             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 760),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                              backing: .buffered, defer: false)
             w.titlebarAppearsTransparent = true
             w.titleVisibility = .hidden
             w.title = "Token Ledger"
+            w.contentMinSize = NSSize(width: 380, height: 420)
+            w.contentMaxSize = NSSize(width: 380, height: 4000)
             w.isReleasedWhenClosed = false
             w.backgroundColor = window.backgroundColor
             w.appearance = NSAppearance(named: .darkAqua)
             w.contentView = ledgerContent()
-            w.setFrameAutosaveName("GPUBuddyLedger")
-            if !w.setFrameUsingName("GPUBuddyLedger") {
+            w.setFrameAutosaveName("GPUBuddyLedger2")
+            if !w.setFrameUsingName("GPUBuddyLedger2") {
                 w.setFrameTopLeftPoint(NSPoint(x: window.frame.maxX + 12, y: window.frame.maxY))
             }
             ledgerWindow = w
