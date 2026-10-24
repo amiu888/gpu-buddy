@@ -48,6 +48,7 @@ open "app/GPU Buddy.app"
 | `GET /api/v1/usage?from=<unix>&to=<unix>&group=hour\|day\|month` | the same for any date range |
 | `GET /api/v1/usage/summary` | token totals for today, this week, this month, YTD and all time |
 | `GET /api/v1/cost?preset=today&cache_hit=0.5&batch=1` | what the period's tokens would cost on frontier cloud models |
+| `GET /api/v1/explain?pid=N` | what a busy script is doing, in plain English, with the evidence used |
 | `GET /api/v1/power` | chip power right now (GPU, CPU, Neural Engine, memory) and joules per token |
 | `GET /api/v1/stream` | Server-Sent Events, one snapshot per second |
 | `GET /api/v1/pairing` | this Mac's pairing code (only from this Mac, over 127.0.0.1) |
@@ -91,6 +92,26 @@ The whole Mac is measured too, from its power controller (the SMC's total system
 If power was measured for only part of a period (for example, before the update that added it), the rest is filled in at the measured average power, and the ledger says so.
 
 The Token Ledger shows GPU and whole-chip energy for any period, the energy that went into tokens, what the chip's electricity cost (set your price per kWh), and what the same tokens would cost on the Claude API at list prices. The whole Mac at the wall uses more than the chip: fans, SSD, display and power-supply losses aren't included.
+
+## What is that script doing?
+
+Activity Monitor says "python". GPU Buddy tells you, in plain English, what each busy script is doing, for example:
+
+> It's currently analyzing images from your media folder, having processed about 800 of 131,000 so far, with about 36 hours left to finish.
+
+How it works:
+
+- gpud gathers evidence about the process:
+  - the command and folder
+  - the script's own description (the start of its code)
+  - data files it has open, and the end of its log
+  - which servers it talks to (local AI model servers are named with their model)
+  - helper programs it started (ffmpeg, exiftool…)
+- A **local** AI model server that already has a model loaded writes one or two sentences from that evidence. gpud never makes a server load a model for this, and nothing leaves your Mac.
+- With no model loaded, a simpler sentence is built from the same evidence.
+- Explanations are refreshed only when the progress changes, at most every 10 minutes per process. Each one costs a few hundred tokens of your local model, counted in the ledger like any other request.
+
+The main window shows it in the **🗣 What's happening** card and under each script in the process list. `GET /api/v1/explain?pid=N` returns the explanation and the evidence it was based on. Set `GPUD_EXPLAIN=0` to turn it off, or `GPUD_EXPLAIN_URL=http://127.0.0.1:PORT` to choose the server.
 
 ## What would the cloud cost?
 

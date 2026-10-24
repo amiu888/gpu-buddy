@@ -15,6 +15,8 @@ serves them over a local HTTP API:
                               or ?from=<unix>&to=<unix>, &group=hour|day|month)
   GET /api/v1/usage/summary -> token totals for today, this week, this month, YTD and all time
   GET /api/v1/power        -> chip power right now (GPU, CPU, ANE, DRAM) and energy per token
+  GET /api/v1/explain      -> what each busy script is doing, in plain English (?pid=N for one,
+                              with the evidence used; &refresh=1 to ask again)
   GET /api/v1/cost         -> what the period's tokens would cost on frontier cloud models
                               (?preset=… or ?from=&to=, &cache_hit=0..0.95, &batch=1,
                               &thinking=0..3, &tokenizer=0.5..2)
@@ -44,6 +46,7 @@ import hmac
 import json
 import os
 import plistlib
+import re
 import secrets
 import signal
 import socket
@@ -57,7 +60,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 RETENTION_SECONDS = 24 * 3600
 STATE_DIR = os.path.expanduser("~/Library/Application Support/GPUBuddy")
 DEFAULT_DB = os.path.join(STATE_DIR, "history.db")
@@ -417,6 +420,247 @@ class PowerWatcher:
             return self.latest, energy
 
 
+class Explainer:
+    """Plain-English answers to "what is this program doing?" for the busy processes.
+
+    For each script using the GPU it gathers evidence (command, folder, the top of the script,
+    data files it has open, the end of its log, who it talks to, helper programs it started),
+    then asks a local LLM server to sum it up in a sentence or two. Nothing leaves the Mac:
+    only servers gpud found on this machine (or GPUD_EXPLAIN_URL) are asked. Without one, the
+    evidence is turned into a sentence by simple rules. GPUD_EXPLAIN=0 turns it off.
+    """
+
+    REFRESH = 600  # ask again at most every 10 minutes per process, and only if the evidence changed
+    SYSTEM = ("You explain what a computer program is doing to a non-programmer. Answer with one or two short, "
+              "plain-English sentences: what it is doing right now, on what, and how far along it is if that's known. "
+              "No code words, no technical jargon, and no file paths longer than the last two folders.")
+    SKIP_FILES = ("/venv/", "/site-packages/", "/System/", "/usr/", "/Library/Caches/", "/private/var/", "/dev/",
+                  "/.cache/", "/Frameworks/", "/opt/homebrew/Cellar/", "/node_modules/")
+    SKIP_EXT = (".so", ".dylib", ".pyc", ".py", ".js", ".dat", ".db-shm", ".db-wal", ".list", ".data", ".weights")
+
+    def __init__(self, sampler, tokens):
+        self.sampler = sampler
+        self.tokens = tokens
+        self.lock = threading.Lock()
+        self.cache = {}  # pid -> {"text", "source", "at", "evidence", "key"}
+        self.enabled = os.environ.get("GPUD_EXPLAIN", "1") != "0"
+        self.url = os.environ.get("GPUD_EXPLAIN_URL", "").rstrip("/")
+
+    def get(self, pid):
+        with self.lock:
+            return self.cache.get(pid)
+
+    # --- evidence
+
+    def evidence(self, p):
+        pid = p["pid"]
+        ev = {"command": p.get("command") or p["name"], "cwd": p.get("cwd") or "", "elapsed": "", "script": "",
+              "files": [], "log": "", "talks_to": [], "children": []}
+        try:
+            ev["elapsed"] = run(["ps", "-o", "etime=", "-p", str(pid)]).decode().strip()
+        except Exception:
+            pass
+        # The script itself: its docstring and first lines say what it's for.
+        for tok in ev["command"].split()[1:]:
+            if tok.endswith((".py", ".js", ".ts", ".rb", ".sh", ".mjs")):
+                path = os.path.join(os.path.expanduser(ev["cwd"]), os.path.expanduser(tok))
+                try:
+                    with open(path, errors="replace") as f:
+                        ev["script"] = f.read(1800)
+                except OSError:
+                    pass
+                break
+        # Data files it has open right now, and the end of any log it's writing.
+        try:
+            names = run(["lsof", "-p", str(pid), "-Fn"]).decode(errors="replace").splitlines()
+        except Exception:
+            names = []
+        home = os.path.expanduser("~")
+        for line in names:
+            path = line[1:]
+            if not line.startswith("n/") or any(s in path for s in self.SKIP_FILES):
+                continue
+            if path.endswith(".log") and not ev["log"]:
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(max(0, os.path.getsize(path) - 700))
+                        ev["log"] = f.read().decode(errors="replace").split("\n", 1)[-1].strip()
+                except OSError:
+                    pass
+                continue
+            if path.endswith(self.SKIP_EXT) or os.path.isdir(path) or not path.startswith((home, "/Volumes/")):
+                continue
+            if path not in ev["files"] and len(ev["files"]) < 6:
+                ev["files"].append(short_path(path))
+        # Who it talks to: local LLM servers by name and model, other hosts by address.
+        servers = {s["url"].rsplit(":", 1)[-1]: s for s in self.tokens.sources.values()}
+        try:
+            conns = run(["lsof", "-nP", "-a", "-p", str(pid), "-i", "-Fn"]).decode().splitlines()
+        except Exception:
+            conns = []
+        for line in conns:
+            if "->" not in line:
+                continue
+            remote = line[1:].split("->", 1)[1]
+            port = remote.rsplit(":", 1)[-1]
+            if remote.startswith(("127.0.0.1", "[::1]", "localhost")) and port in servers:
+                s = servers[port]
+                desc = f"the local AI model server on port {port}" + (f" ({s['model']})" if s.get("model") else "")
+            else:
+                desc = remote
+            if desc not in ev["talks_to"]:
+                ev["talks_to"].append(desc)
+        # Helper programs it started (ffmpeg, exiftool, …).
+        try:
+            for line in run(["ps", "-axo", "pid=,ppid=,args="]).decode(errors="replace").splitlines():
+                parts = line.split(None, 2)
+                wrapper = parts[2].split()[0].rsplit("/", 1)[-1] in ("caffeinate", "nice", "time", "nohup") if len(parts) == 3 else True
+                if len(parts) == 3 and parts[1] == str(pid) and "resource_tracker" not in parts[2] and not wrapper:
+                    ev["children"].append(short_path(parts[2])[:200])
+        except Exception:
+            pass
+        return ev
+
+    @staticmethod
+    def render(ev):
+        out = [f"Program: {short_path(ev['command'])[:300]}", f"Folder: {short_path(ev['cwd'])}"]
+        if ev["elapsed"]:
+            out.append(f"Running for: {ev['elapsed']}")
+        if ev["script"]:
+            out.append("Start of the script:\n" + ev["script"])
+        if ev["children"]:
+            out.append("Helper programs it started:\n" + "\n".join("- " + c for c in ev["children"][:5]))
+        if ev["files"]:
+            out.append("Files it has open:\n" + "\n".join("- " + f for f in ev["files"]))
+        if ev["talks_to"]:
+            out.append("Talking to:\n" + "\n".join("- " + t for t in ev["talks_to"][:5]))
+        if ev["log"]:
+            out.append("End of its log:\n" + ev["log"])
+        return "\n".join(out)
+
+    @staticmethod
+    def rules(p, ev):
+        """A sentence without an LLM, from the same evidence."""
+        doc = re.search(r'"""\s*(.+?)(?:\n\n|""")', ev["script"], re.S) or re.search(r"^#(?!!)\s*(.+)$", ev["script"], re.M)
+        what = (doc.group(1).strip().split("\n")[0].rstrip(".") if doc else p.get("activity") or p["name"])
+        bits = [what[:1].upper() + what[1:]]
+        if ev["children"]:
+            tool = os.path.basename(ev["children"][0].split()[0])
+            target = os.path.basename(ev["children"][0].split()[-1])
+            bits.append(f"right now {tool} is working on {target}")
+        if ev["talks_to"]:
+            bits.append("talking to " + ev["talks_to"][0])
+        last = ev["log"].strip().splitlines()[-1] if ev["log"].strip() else ""
+        if last:
+            bits.append(f"latest log: {last[-120:]}")
+        return "; ".join(bits) + "."
+
+    # --- asking a local model
+
+    def _endpoint(self):
+        """(base url, model id) of a local text model to ask, or None."""
+        if self.url:
+            return self.url, self._model_id(self.url, "prometheus")
+        with self.tokens.lock:
+            sources = [s for s in self.tokens.sources.values() if s["kind"] in ("mlx-json", "prometheus")]
+        sources.sort(key=lambda s: "vl" in (s.get("model") or "").lower())  # text models first
+        for s in sources:
+            model = self._model_id(s["url"], s["kind"])
+            if model:
+                return s["url"], model
+        return None
+
+    @staticmethod
+    def _model_id(base, kind):
+        """The model a server has loaded right now, or None. Only loaded models are asked: making a server
+        load a big model just to describe a script would take gigabytes of memory away from your work.
+        MLX servers report it in /metrics (their /v1/models lists every model on disk); llama.cpp and
+        vLLM list only the loaded one in /v1/models."""
+        try:
+            if kind == "mlx-json":
+                return (json.loads(http_get(base + "/metrics", timeout=2)).get("server") or {}).get("loaded_model")
+            d = json.loads(http_get(base + "/v1/models", timeout=2))
+            return d["data"][0]["id"] if d.get("data") else None
+        except Exception:
+            return None
+
+    def _ask(self, endpoint, text):
+        base, model = endpoint
+        body = json.dumps({"model": model, "max_tokens": 120, "temperature": 0.2, "stream": False,
+                           "messages": [{"role": "system", "content": self.SYSTEM},
+                                        {"role": "user", "content": text}]}).encode()
+        req = urllib.request.Request(base + "/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=90) as r:
+            answer = json.loads(r.read())["choices"][0]["message"]["content"] or ""
+        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.S).strip()
+        return answer.split("\n\n")[0].strip()
+
+    # --- loop
+
+    def candidates(self):
+        with self.sampler.lock:
+            snap = self.sampler.latest
+        if not snap:
+            return []
+        servers = {s["pid"] for s in self.tokens.sources.values()}
+        out = []
+        for p in snap["processes"][:5]:
+            name = p["name"].lower()
+            interpreted = any(name.startswith(i) for i in INTERPRETERS)
+            if p["pid"] in servers or p["name"] in KNOWN or p["pid"] == os.getpid():
+                continue  # model servers and well-known apps already have good names
+            if interpreted or p.get("is_ai"):
+                out.append(p)
+        return out
+
+    def explain(self, p, force=False):
+        ev = self.evidence(p)
+        # What counts as "changed": the helper programs and the log's last line, not every open file.
+        key = json.dumps([ev["command"], [c.split()[0] for c in ev["children"]], ev["log"][-200:]])
+        old = self.get(p["pid"])
+        now = time.time()
+        if old and not force and (old["key"] == key or now - old["at"] < self.REFRESH):
+            with self.lock:
+                old["evidence"] = ev  # keep the live details fresh
+            return old
+        text, source = None, "rules"
+        endpoint = self._endpoint() if self.enabled else None
+        if endpoint:
+            try:
+                text, source = self._ask(endpoint, self.render(ev)), "local-llm"
+            except Exception as e:
+                print(f"gpud: explain failed for pid {p['pid']}: {e}", file=sys.stderr, flush=True)
+        if not text:
+            text, source = self.rules(p, ev), "rules"
+        entry = {"text": text, "source": source, "at": now, "evidence": ev, "key": key,
+                 "model": os.path.basename(str(endpoint[1]).rstrip("/")) if endpoint and source == "local-llm" else None}
+        with self.lock:
+            self.cache[p["pid"]] = entry
+        return entry
+
+    def loop(self):
+        while True:
+            try:
+                live = set()
+                for p in self.candidates():
+                    live.add(p["pid"])
+                    self.explain(p)
+                with self.lock:
+                    for pid in [pid for pid in self.cache if pid not in live and not self._alive(pid)]:
+                        del self.cache[pid]
+            except Exception as e:
+                print(f"gpud: explainer: {e}", file=sys.stderr, flush=True)
+            time.sleep(15)
+
+    @staticmethod
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
 def describe_server(args):
     """Short name for an LLM server process: "mlx_vlm.server", "ollama", "llama-server"."""
     tokens = args.split()
@@ -490,7 +734,7 @@ class HistoryDB:
         self._pending = 0
 
     def add(self, snap, by_model=None, energy=None, model_energy=None):
-        keys = ("pid", "name", "gpu_percent", "is_ai", "activity", "command", "cwd", "tok_s")
+        keys = ("pid", "name", "gpu_percent", "is_ai", "activity", "command", "cwd", "tok_s", "explain")
         procs = [{k: p[k] for k in keys if k in p} for p in snap["processes"][:5]]
         with self.lock:
             top = top_process(procs) or ("", 0, 0)
@@ -687,6 +931,7 @@ class GPUSampler:
         self.db = db
         self.tokens = tokens
         self.power = power
+        self.explainer = None  # set by main()
         self.gpu_peak_w = 0.0
         self._ai_pool = 0.0  # LLM energy (J) not yet matched to the tokens it produced
         self._ai_pool_t = time.time()
@@ -818,6 +1063,11 @@ class GPUSampler:
             self._tok24_refreshed = now
         self._tok24[0] += gen_d
         self._tok24[1] += prompt_d
+        if self.explainer:
+            for p in active:
+                e = self.explainer.get(p["pid"])
+                if e:
+                    p["explain"] = e["text"]
         speed = {s["pid"]: s for s in sources if s["pid"]}
         for p in active:
             if p["pid"] in speed:
@@ -1268,6 +1518,25 @@ def make_handler(sampler, identity=None, remote=False):
                 with sampler.lock:
                     snap = sampler.latest
                 return self._json(snap["tokens"] if snap else {})
+            if url.path == "/api/v1/explain":
+                ex = sampler.explainer
+                if "pid" in q:
+                    try:
+                        pid = int(q["pid"][0])
+                    except ValueError:
+                        return self._json({"error": "pid must be a number"}, 400)
+                    with sampler.lock:
+                        procs = sampler.latest["processes"] if sampler.latest else []
+                    p = next((p for p in procs if p["pid"] == pid), None)
+                    entry = ex.get(pid)
+                    if p and (q.get("refresh", ["0"])[0] == "1" or not entry):
+                        entry = ex.explain(p, force=True)
+                    if not entry:
+                        return self._json({"error": "that process isn't using the GPU right now"}, 404)
+                    return self._json(dict({k: v for k, v in entry.items() if k != "key"}, pid=pid))
+                with ex.lock:
+                    return self._json({"processes": [{"pid": pid, "text": e["text"], "source": e["source"], "at": e["at"],
+                                                      "model": e["model"]} for pid, e in ex.cache.items()]})
             if url.path == "/api/v1/power":
                 with sampler.lock:
                     snap = sampler.latest
@@ -1393,6 +1662,8 @@ def main():
     threading.Thread(target=power.loop, daemon=True).start()
     sampler = GPUSampler(args.interval, HistoryDB(args.db), tokens, power)
     sampler.remote_port = args.remote_port
+    sampler.explainer = Explainer(sampler, tokens)
+    threading.Thread(target=sampler.explainer.loop, daemon=True).start()
     threading.Thread(target=sampler.loop, daemon=True).start()
 
     identity = None

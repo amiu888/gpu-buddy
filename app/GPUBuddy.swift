@@ -82,6 +82,8 @@ struct Snapshot: Decodable {
         let command: String?
         let cwd: String?
         let tok_s: Double?
+        /// What it's doing, in plain English (from gpud's explainer).
+        let explain: String?
         var id: Int { pid }
 
         /// "train.py · ~/projects/demo"
@@ -1576,7 +1578,13 @@ struct ProcessRow: View {
                     .font(.system(size: 11, weight: .bold, design: .rounded)).monospacedDigit()
                     .foregroundColor(.white.opacity(0.75))
             }
-            if !p.detail.isEmpty {
+            if let e = p.explain, !e.isEmpty {
+                Text("🗣 " + e)
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundColor(.white.opacity(0.7))
+                    .lineLimit(1)
+                    .padding(.leading, 20)
+            } else if !p.detail.isEmpty {
                 Text(p.detail)
                     .font(.system(size: 10, weight: .medium, design: .rounded))
                     .foregroundColor(.white.opacity(0.55))
@@ -1586,11 +1594,34 @@ struct ProcessRow: View {
             }
         }
         .contentShape(Rectangle())
-        .help([p.command, p.cwd.map { "in \($0)" }].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n"))
+        .help([p.explain.map { "🗣 \($0)\n" }, p.command, p.cwd.map { "in \($0)" }].compactMap { $0 }.filter { !$0.isEmpty }
+            .joined(separator: "\n"))
         .contextMenu {
             Button("Copy Command") { copyToClipboard(p.command ?? p.name) }
             Text("PID \(p.pid)")
         }
+    }
+}
+
+/// What the busiest script is doing, in plain English.
+struct ExplainCard: View {
+    let p: Snapshot.Proc
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("🗣 WHAT'S HAPPENING").font(.system(size: 8.5, weight: .black, design: .rounded))
+                .foregroundColor(.white.opacity(0.6))
+            Text(p.explain ?? "")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .fixedSize(horizontal: false, vertical: true)
+            Text(p.label).font(.system(size: 8.5, weight: .medium, design: .rounded))
+                .foregroundColor(.white.opacity(0.45)).lineLimit(1).truncationMode(.middle)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.06)))
+        .help((p.command ?? p.name) + "\n\nExplained by a model running on your Mac, from the script's own description, "
+              + "the files it has open, its log and the programs it started.")
     }
 }
 
@@ -2065,6 +2096,9 @@ struct ContentView: View {
 
                 TokenCard(tokens: store.online ? s?.tokens : nil, time: anim.time) { fleet.onOpenLedger?() }
                 PowerCard(power: store.online ? s?.power : nil)
+                if let p = topProcesses(s, 5).first(where: { !($0.explain ?? "").isEmpty }) {
+                    ExplainCard(p: p)
+                }
 
                 VStack(spacing: 4) {
                     ForEach(topProcesses(s, 3)) { ProcessRow(p: $0) }
