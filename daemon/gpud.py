@@ -54,7 +54,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 RETENTION_SECONDS = 24 * 3600
 STATE_DIR = os.path.expanduser("~/Library/Application Support/GPUBuddy")
 DEFAULT_DB = os.path.join(STATE_DIR, "history.db")
@@ -665,6 +665,7 @@ class GPUSampler:
         self._cwd_cache = {}
         self._prev_ts = None
         self._static = self._read_static()
+        self.host = HostInfo(self._static)
 
     # ---- static hardware info -------------------------------------------------
     def _read_static(self):
@@ -843,6 +844,7 @@ class GPUSampler:
         total = st["system_memory_bytes"] or 1
         snap = {
             "timestamp": now,
+            "host": self.host.get(),
             "gpu": {
                 "model": st["model"],
                 "cores": st["cores"],
@@ -896,6 +898,7 @@ class GPUSampler:
         fun["est_current_tflops"] = round(row["util"] / 100 * st["est_peak_tflops"], 2)
         return {
             "timestamp": row["t"],
+            "host": self.host.get(),
             "replay": True,
             "gpu": {"model": st["model"], "cores": st["cores"], "utilization_percent": row["util"],
                     "renderer_percent": 0, "tiler_percent": 0, "mood": row["mood"]},
@@ -964,6 +967,78 @@ def local_hostname():
         return run(["scutil", "--get", "LocalHostName"]).decode().strip() + ".local"
     except Exception:
         return socket.gethostname()
+
+
+class HostInfo:
+    """Who this Mac is, for viewers on other Macs: its names, hardware, macOS and network addresses.
+
+    Hardware is read once; names and addresses are re-read every minute so a rename or a network
+    change shows up without restarting gpud.
+    """
+
+    def __init__(self, static):
+        hw = {}
+        try:
+            hw = json.loads(run(["system_profiler", "SPHardwareDataType", "-json"]))["SPHardwareDataType"][0]
+        except Exception:
+            pass
+        procs = str(hw.get("number_processors", "")).replace("proc ", "").split(":")  # "16:12:4:0"
+        count = lambda i: int(procs[i]) if len(procs) > i and procs[i].isdigit() else None
+        try:
+            model_id = run(["sysctl", "-n", "hw.model"]).decode().strip()
+        except Exception:
+            model_id = ""
+        try:
+            macos = run(["sw_vers", "-productVersion"]).decode().strip()
+            build = run(["sw_vers", "-buildVersion"]).decode().strip()
+        except Exception:
+            macos = build = ""
+        self.fixed = {
+            "model_name": hw.get("machine_name") or "Mac",   # "Mac Studio"
+            "model_id": model_id,                             # "Mac16,9"
+            "chip": static["model"],
+            "gpu_cores": static["cores"],
+            "cpu_cores": count(0) or os.cpu_count(),
+            "cpu_performance_cores": count(1),
+            "cpu_efficiency_cores": count(2),
+            "memory_bytes": static["system_memory_bytes"],
+            "macos": macos,
+            "macos_build": build,
+            "gpud_version": VERSION,
+        }
+        self._live = {}
+        self._read_at = 0.0
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _addresses():
+        """IPv4 address of every active network interface, with what kind of port it is."""
+        kinds = {}
+        try:
+            port = None
+            for line in run(["networksetup", "-listallhardwareports"]).decode().splitlines():
+                if line.startswith("Hardware Port:"):
+                    port = line.split(":", 1)[1].strip()
+                elif line.startswith("Device:") and port:
+                    kinds[line.split(":", 1)[1].strip()] = port
+        except Exception:
+            pass
+        out = []
+        for dev in sorted(kinds) or [f"en{i}" for i in range(10)]:
+            try:
+                ip = subprocess.run(["ipconfig", "getifaddr", dev], capture_output=True, timeout=2).stdout.decode().strip()
+            except Exception:
+                ip = ""
+            if ip:
+                out.append({"interface": dev, "kind": kinds.get(dev, dev), "ip": ip})
+        return out
+
+    def get(self):
+        with self.lock:
+            if time.time() - self._read_at > 60:
+                self._live = {"name": computer_name(), "hostname": local_hostname(), "addresses": self._addresses()}
+                self._read_at = time.time()
+            return dict(self.fixed, **self._live)
 
 
 class Identity:
@@ -1055,8 +1130,9 @@ def make_handler(sampler, identity=None, remote=False):
                 if not hmac.compare_digest(sent, ("Bearer " + identity.token).encode()):
                     return self._json({"error": "pairing code required"}, 401)
             if url.path == "/health":
+                info = sampler.host.get()
                 return self._json({"ok": True, "version": VERSION, "id": identity.id if identity else None,
-                                   "name": computer_name(), "model": sampler._static["model"]})
+                                   "name": info["name"], "model": sampler._static["model"], "host": info})
             if url.path == "/api/v1/pairing" and not remote:
                 # Only for apps on this Mac: no CORS header, and refuse anything not addressed to
                 # loopback so a web page can't read it through DNS rebinding.
@@ -1156,9 +1232,11 @@ def make_handler(sampler, identity=None, remote=False):
     return Handler
 
 
-def advertise(identity, port, model):
+def advertise(identity, port, info):
     """Announce this Mac over Bonjour so viewers on the network can find it."""
-    txt = {"id": identity.id, "host": local_hostname(), "port": port, "model": model, "ver": VERSION}
+    txt = {"id": identity.id, "host": info["hostname"], "port": port, "model": info["chip"], "ver": VERSION,
+           "mac": info["model_name"], "gpu": info["gpu_cores"], "mem": round(info["memory_bytes"] / 2**30),
+           "os": info["macos"]}
     proc = subprocess.Popen(["dns-sd", "-R", computer_name(), BONJOUR_TYPE, "local", str(port)]
                             + [f"{k}={v}" for k, v in txt.items()],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1205,7 +1283,7 @@ def main():
             rserver.socket = identity.tls_context().wrap_socket(rserver.socket, server_side=True,
                                                                 do_handshake_on_connect=False)
             threading.Thread(target=rserver.serve_forever, daemon=True).start()
-            advertise(identity, args.remote_port, sampler._static["model"])
+            advertise(identity, args.remote_port, sampler.host.get())
             print(f"gpud: remote viewing on https://{local_hostname()}:{args.remote_port} "
                   f"(pairing code: python3 gpud.py --pairing-code)", flush=True)
         except Exception as e:

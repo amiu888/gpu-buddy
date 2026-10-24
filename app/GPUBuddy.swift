@@ -89,6 +89,53 @@ struct Snapshot: Decodable {
     let fun: Fun
     let tokens: Tokens?
     let power: Power?
+    let host: HostInfo?
+}
+
+/// Who a Mac is: its names, hardware, macOS and network addresses (from gpud).
+struct HostInfo: Decodable {
+    struct Address: Decodable {
+        let interface: String
+        let kind: String
+        let ip: String
+    }
+    let name: String
+    let hostname: String
+    let model_name: String
+    let model_id: String?
+    let chip: String
+    let gpu_cores: Int
+    let cpu_cores: Int?
+    let cpu_performance_cores: Int?
+    let cpu_efficiency_cores: Int?
+    let memory_bytes: Double
+    let macos: String
+    let macos_build: String?
+    let addresses: [Address]
+    let gpud_version: String?
+
+    /// "Mac Studio · M4 Max · 40-core GPU · 64 GB"
+    var hardware: String {
+        "\(model_name) · \(chip.replacingOccurrences(of: "Apple ", with: "")) · \(gpu_cores)-core GPU · \(Int((memory_bytes / 1_073_741_824).rounded())) GB"
+    }
+    /// "Ethernet 10.0.2.124 · Wi-Fi 10.0.2.123"
+    var network: String {
+        addresses.isEmpty ? "no network" : addresses.map { "\($0.kind) \($0.ip)" }.joined(separator: " · ")
+    }
+    /// Everything, for tooltips.
+    var details: String {
+        var cpu = cpu_cores.map { "\($0)-core CPU" } ?? ""
+        if let p = cpu_performance_cores, let e = cpu_efficiency_cores { cpu += " (\(p) performance + \(e) efficiency)" }
+        return [
+            name,
+            "\(model_name)\(model_id.map { " (\($0))" } ?? "")",
+            "\(chip) · \(gpu_cores)-core GPU · \(cpu)",
+            "\(Int((memory_bytes / 1_073_741_824).rounded())) GB memory",
+            "macOS \(macos)\(macos_build.map { " (\($0))" } ?? "")",
+            "Network name: \(hostname)",
+        ].joined(separator: "\n") + addresses.map { "\n\($0.kind) (\($0.interface)): \($0.ip)" }.joined()
+            + (gpud_version.map { "\ngpud \($0)" } ?? "")
+    }
 }
 
 struct Timeline: Decodable {
@@ -161,6 +208,7 @@ struct Health: Decodable {
     let id: String?
     let name: String?
     let model: String?
+    let host: HostInfo?
 }
 
 struct Pairing: Decodable {
@@ -252,7 +300,11 @@ final class GPUStore: ObservableObject {
     /// The one on screen; only it fetches the timeline.
     var active = false
 
-    let host: HostRecord
+    /// Name and address; the name follows the Mac if it's renamed.
+    @Published private(set) var host: HostRecord
+    /// How long the last status request took, in milliseconds.
+    @Published private(set) var latency: Double?
+    var onRenamed: (() -> Void)?
     let client: APIClient
     private var timer: Timer?
     private var ticks = 0
@@ -302,13 +354,20 @@ final class GPUStore: ObservableObject {
     }
 
     private func poll() async {
+        let t0 = Date()
         if let s: Snapshot = await client.get("/api/v1/status") {
+            latency = Date().timeIntervalSince(t0) * 1000
             snap = s
             online = true
+            if !host.isLocal, let name = s.host?.name, !name.isEmpty, name != host.name {
+                host.name = name
+                onRenamed?()
+            }
             history.append(Double(s.gpu.utilization_percent))
             if history.count > 60 { history.removeFirst(history.count - 60) }
         } else {
             online = false
+            latency = nil
         }
         problem = online ? nil : client.problem
         if online && active && (timeline == nil || ticks % 10 == 0) { await fetchTimeline() }
@@ -326,6 +385,16 @@ final class Fleet: ObservableObject {
         let name: String
         let address: String
         let model: String
+        let txt: [String: String]
+
+        /// "Mac Studio · M4 Max · 40-core GPU · 64 GB · macOS 26.5"
+        var summary: String {
+            var parts = [txt["mac"], model.replacingOccurrences(of: "Apple ", with: "")].compactMap { $0 }.filter { !$0.isEmpty }
+            if let g = txt["gpu"] { parts.append("\(g)-core GPU") }
+            if let m = txt["mem"] { parts.append("\(m) GB") }
+            if let os = txt["os"] { parts.append("macOS \(os)") }
+            return parts.joined(separator: " · ")
+        }
     }
 
     @Published private(set) var stores: [GPUStore] = []
@@ -368,6 +437,7 @@ final class Fleet: ObservableObject {
     }
 
     private func wire(_ s: GPUStore) {
+        s.onRenamed = { [weak self] in self?.save() }
         s.onUpdate = { [weak self] s in
             guard let self, s === self.current else { return }
             self.onUpdate?(s)
@@ -450,7 +520,7 @@ final class Fleet: ObservableObject {
                 guard case .service(let name, _, _, _) = r.endpoint, case .bonjour(let txt) = r.metadata else { return nil }
                 let d = txt.dictionary
                 guard let id = d["id"], let host = d["host"] else { return nil }
-                return Found(id: id, name: name, address: "\(host):\(d["port"] ?? "8766")", model: d["model"] ?? "")
+                return Found(id: id, name: name, address: "\(host):\(d["port"] ?? "8766")", model: d["model"] ?? "", txt: d)
             }
             MainActor.assumeIsolated { self?.update(found: list) }
         }
@@ -1461,7 +1531,10 @@ struct ContentView: View {
                             .font(.system(size: 11, weight: .black, design: .rounded))
                             .foregroundColor(moodColor)
                         Text(store.scrubTime.map { "⏪ \(agoText($0))" }
-                             ?? s.map { "\($0.gpu.model.replacingOccurrences(of: "Apple ", with: "")) · \($0.gpu.cores) cores" }
+                             ?? s.map { snap in
+                                 let chip = "\(snap.gpu.model.replacingOccurrences(of: "Apple ", with: "")) · \(snap.gpu.cores) cores"
+                                 return fleet.stores.count > 1 ? "\(snap.host?.name ?? store.host.title) · \(chip)" : chip
+                             }
                              ?? "waiting for gpud")
                             .font(.system(size: 9.5, weight: .medium, design: .rounded))
                             .foregroundColor(.white.opacity(0.6))
@@ -1633,8 +1706,21 @@ struct HostChip: View {
             .overlay(Capsule().stroke(selected ? gold.opacity(0.8) : .clear, lineWidth: 1))
         }
         .buttonStyle(.plain)
-        .help(store.host.isLocal ? "This Mac" : "\(store.host.name) · \(store.host.address)\(store.problem.map { "\n\($0)" } ?? "")")
+        .help(hostTooltip(store))
     }
+}
+
+/// Name, hardware, network and connection of one Mac, for tooltips.
+@MainActor func hostTooltip(_ store: GPUStore) -> String {
+    var lines = [store.snap?.host?.details ?? store.host.name]
+    if store.host.isLocal {
+        lines.append("This Mac, over 127.0.0.1")
+    } else {
+        lines.append("Connected to \(store.host.address) · 🔒 TLS, certificate pinned"
+                     + (store.latency.map { String(format: " · %.0f ms", $0) } ?? ""))
+    }
+    if let p = store.problem, !store.online { lines.append("⚠️ \(p)") }
+    return lines.joined(separator: "\n")
 }
 
 /// Pair with GPU Buddy on other Macs, and share this Mac's pairing code.
@@ -1670,8 +1756,10 @@ struct MacsView: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(f.name).font(.system(size: 12, weight: .bold, design: .rounded))
-                                Text("\(f.model.replacingOccurrences(of: "Apple ", with: "")) · \(f.address)")
-                                    .font(.system(size: 9.5, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.5))
+                                Text(f.summary).font(.system(size: 9.5, weight: .medium, design: .rounded))
+                                    .foregroundColor(.white.opacity(0.65)).lineLimit(1).minimumScaleFactor(0.8)
+                                Text("🌐 \(f.address)").font(.system(size: 9.5, weight: .medium, design: .rounded))
+                                    .foregroundColor(.white.opacity(0.5)).lineLimit(1)
                             }
                             Spacer()
                             if fleet.isPaired(f.id) {
@@ -1788,13 +1876,30 @@ struct PairedRow: View {
         HStack(spacing: 6) {
             Circle().fill(store.online ? Color.green : Color.red.opacity(0.7)).frame(width: 7, height: 7)
             VStack(alignment: .leading, spacing: 1) {
-                Text(store.host.title).font(.system(size: 12, weight: .bold, design: .rounded))
+                HStack(spacing: 5) {
+                    Text(store.host.isLocal ? "This Mac" : store.host.name).font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+                    if store.host.isLocal, let n = store.snap?.host?.name {
+                        Text(n).font(.system(size: 10, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.5))
+                    }
+                    if store.online {
+                        Text("\(store.snap?.gpu.utilization_percent ?? 0)%").font(.system(size: 10, weight: .heavy, design: .rounded))
+                            .monospacedDigit().foregroundColor(Color(red: 1, green: 0.85, blue: 0.5))
+                    }
+                }
+                if let h = store.snap?.host {
+                    Text("\(h.hardware) · macOS \(h.macos)").lineLimit(1).minimumScaleFactor(0.8)
+                        .foregroundColor(.white.opacity(0.65))
+                    Text("🌐 \(h.hostname) · \(h.network)").lineLimit(1).minimumScaleFactor(0.8)
+                }
                 Text(store.online
-                     ? "\(store.snap?.gpu.utilization_percent ?? 0)% GPU · " + (store.host.isLocal ? "local" : "\(store.host.address) · 🔒 TLS")
-                     : (store.problem ?? "connecting…"))
-                    .font(.system(size: 9.5, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.5))
+                     ? (store.host.isLocal ? "local" : "🔒 TLS · \(store.host.address)"
+                        + (store.latency.map { String(format: " · %.0f ms", $0) } ?? ""))
+                     : "⚠️ " + (store.problem ?? "connecting…"))
                     .lineLimit(1)
             }
+            .font(.system(size: 9.5, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.5))
+            .help(hostTooltip(store))
             Spacer()
             if store !== fleet.current {
                 Button("Show") { fleet.select(store) }.buttonStyle(.plain)

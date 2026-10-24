@@ -71,6 +71,8 @@ Install gpud on every Mac you want to watch (`./install.sh`), then open GPU Budd
 2. On the watching Mac, open **Macs (⌘K)**. Macs running gpud on your network show up by themselves (Bonjour). Click **Pair…** and paste the code, or add one by address (`Studio.local` or an IP).
 3. Each Mac gets a chip under Chippy with its live %. Click one, or press ⌘] / ⌘[, to switch. The Token Ledger follows the selected Mac.
 
+Every Mac reports who it is: its name, model (e.g. Mac Studio, Mac16,9), chip, GPU and CPU cores, memory, macOS version, network name (`Studio.local`) and the IP address of each active interface (Ethernet, Wi-Fi…). The Macs window shows this with the connection's encryption and latency, and hovering a Mac's chip shows all of it. If a Mac is renamed, the new name shows up on its own. The same info is in `/health`, in every `/status` snapshot (`host`), and in the Bonjour record, so Macs on the network are identified before you pair.
+
 How it's protected:
 
 - Other Macs reach gpud over **TLS** on port 8766. The plain-HTTP API on 8765 only listens on 127.0.0.1.
