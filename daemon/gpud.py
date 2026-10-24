@@ -57,7 +57,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 RETENTION_SECONDS = 24 * 3600
 STATE_DIR = os.path.expanduser("~/Library/Application Support/GPUBuddy")
 DEFAULT_DB = os.path.join(STATE_DIR, "history.db")
@@ -361,7 +361,7 @@ class PowerWatcher:
         self.lock = threading.Lock()
         self.latest = None  # watts per block, from the last interval
         self.error = None
-        self._energy = dict.fromkeys(POWER_KEYS, 0.0)  # joules since the last take()
+        self._energy = self._zero()  # joules since the last take()
         self._proc = None
         atexit.register(lambda: self._proc and self._proc.terminate())
 
@@ -377,7 +377,7 @@ class PowerWatcher:
         out = os.path.join(STATE_DIR, "gpupower")
         if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(src):
             os.makedirs(STATE_DIR, exist_ok=True)
-            subprocess.run(["clang", "-O2", "-o", out, src, "-framework", "CoreFoundation", "-lIOReport"],
+            subprocess.run(["clang", "-O2", "-o", out, src, "-framework", "CoreFoundation", "-framework", "IOKit", "-lIOReport"],
                            check=True, capture_output=True, timeout=120)
         return out
 
@@ -393,6 +393,11 @@ class PowerWatcher:
                         self.error = None
                         for k in POWER_KEYS:
                             self._energy[k] += d[k + "_w"] * d["dt"]
+                        # The whole Mac (SMC), and the chip's energy over the same seconds, for scaling older hours.
+                        if d.get("system_w") is not None:
+                            self._energy["system"] += d["system_w"] * d["dt"]
+                            self._energy["system_chip"] += sum(d[k + "_w"] for k in POWER_KEYS) * d["dt"]
+                            self._energy["system_seconds"] += d["dt"]
                 self.error = (self._proc.stderr.read().strip() or "gpupower stopped")[:200]
             except Exception as e:
                 self.error = str(e)[:200]
@@ -401,10 +406,14 @@ class PowerWatcher:
                 self.latest = None
             time.sleep(30)
 
+    @staticmethod
+    def _zero():
+        return dict.fromkeys(POWER_KEYS + ("system", "system_chip", "system_seconds"), 0.0)
+
     def take(self):
         """(latest watts or None, joules per block since the last call)."""
         with self.lock:
-            energy, self._energy = self._energy, dict.fromkeys(POWER_KEYS, 0.0)
+            energy, self._energy = self._energy, self._zero()
             return self.latest, energy
 
 
@@ -472,6 +481,11 @@ class HistoryDB:
         self.conn.execute("""CREATE TABLE IF NOT EXISTS power_hourly (
             hour INTEGER PRIMARY KEY, gpu_j REAL, cpu_j REAL, ane_j REAL, dram_j REAL, other_j REAL,
             ai_j REAL, seconds REAL)""")
+        # v1.10: the whole Mac from the SMC (system_j), and the chip's energy and seconds while it was measured.
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(power_hourly)")}
+        for col in ("system_j", "system_chip_j", "system_seconds"):
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE power_hourly ADD COLUMN {col} REAL DEFAULT 0")
         self.conn.commit()
         self._pending = 0
 
@@ -502,11 +516,16 @@ class HistoryDB:
                      int(gen) if (model_energy or {}).get(key) else 0))
             if energy:
                 self.conn.execute(
-                    """INSERT INTO power_hourly VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (hour) DO UPDATE SET
+                    """INSERT INTO power_hourly (hour, gpu_j, cpu_j, ane_j, dram_j, other_j, ai_j, seconds,
+                                                system_j, system_chip_j, system_seconds)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (hour) DO UPDATE SET
                        gpu_j = gpu_j + excluded.gpu_j, cpu_j = cpu_j + excluded.cpu_j, ane_j = ane_j + excluded.ane_j,
                        dram_j = dram_j + excluded.dram_j, other_j = other_j + excluded.other_j,
-                       ai_j = ai_j + excluded.ai_j, seconds = seconds + excluded.seconds""",
-                    (hour, *(energy.get(k, 0.0) for k in POWER_KEYS), energy.get("ai", 0.0), energy.get("seconds", 0.0)))
+                       ai_j = ai_j + excluded.ai_j, seconds = seconds + excluded.seconds,
+                       system_j = system_j + excluded.system_j, system_chip_j = system_chip_j + excluded.system_chip_j,
+                       system_seconds = system_seconds + excluded.system_seconds""",
+                    (hour, *(energy.get(k, 0.0) for k in POWER_KEYS), energy.get("ai", 0.0), energy.get("seconds", 0.0),
+                     energy.get("system", 0.0), energy.get("system_chip", 0.0), energy.get("system_seconds", 0.0)))
             self._pending += 1
             if self._pending >= 10:  # batch commits to keep disk writes low
                 self.conn.execute("DELETE FROM samples WHERE t < ?", (time.time() - RETENTION_SECONDS,))
@@ -587,8 +606,15 @@ class HistoryDB:
             energy = self.conn.execute(
                 f"""SELECT COALESCE(SUM(gpu_j), 0), COALESCE(SUM(cpu_j), 0), COALESCE(SUM(ane_j), 0),
                            COALESCE(SUM(dram_j), 0), COALESCE(SUM(other_j), 0), COALESCE(SUM(ai_j), 0),
-                           COALESCE(SUM(seconds), 0)
+                           COALESCE(SUM(seconds), 0), COALESCE(SUM(system_j), 0), COALESCE(SUM(system_chip_j), 0),
+                           COALESCE(SUM(system_seconds), 0)
                     FROM power_hourly WHERE {where}""", (start, end)).fetchone()
+            # What the rest of the Mac (fans, SSD, ports, network) draws on top of the chip, in watts, averaged over
+            # every second it was measured. It barely changes with load, so it fills in hours before measuring began.
+            sys_all, chip_all, secs_all = self.conn.execute(
+                """SELECT COALESCE(SUM(system_j), 0), COALESCE(SUM(system_chip_j), 0), COALESCE(SUM(system_seconds), 0)
+                   FROM power_hourly""").fetchone()
+            overhead_w = (sys_all - chip_all) / secs_all if secs_all > 60 else None
             power_series = {k: (t, g, a) for k, t, g, a in self.conn.execute(
                 f"""SELECT strftime('{self.GROUPS[group]}', hour, 'unixepoch', 'localtime') AS k, MIN(hour),
                            SUM(gpu_j), SUM(ai_j)
@@ -604,6 +630,11 @@ class HistoryDB:
             "energy": {"gpu_j": round(energy[0], 1), "cpu_j": round(energy[1], 1), "ane_j": round(energy[2], 1),
                        "dram_j": round(energy[3], 1), "soc_j": round(sum(energy[:5]), 1),
                        "ai_j": round(model_j[0], 1), "measured_seconds": round(energy[6]),
+                       # The whole Mac (SMC): measured, plus an estimate for the period's unmeasured chip energy.
+                       "system_measured_j": round(energy[7], 1),
+                       "system_j": round(energy[7] + (sum(energy[:5]) - energy[8])
+                                         + overhead_w * max(0.0, energy[6] - energy[9]), 1) if overhead_w is not None else None,
+                       "system_overhead_w": round(overhead_w, 2) if overhead_w is not None else None,
                        # J per generated token, over the tokens whose energy was measured
                        "j_per_token": round(model_j[0] / model_j[1], 3) if model_j[1] else None},
         }
@@ -834,6 +865,7 @@ class GPUSampler:
             power.update({k + "_w": round(watts[k + "_w"], 2) for k in POWER_KEYS})
             power.update({
                 "soc_w": round(soc, 2),
+                "system_w": round(watts["system_w"], 2) if watts.get("system_w") is not None else None,
                 "ai_w": round(ai_w, 2),
                 "gpu_peak_w": round(self.gpu_peak_w, 1),
                 "j_per_token": round(jpt, 3) if jpt else None,       # right now, while decoding
@@ -1262,7 +1294,17 @@ def make_handler(sampler, identity=None, remote=False):
                 usage = sampler.db.usage(start, end, "year")
                 out = cloud_cost(usage, **opts)
                 e = usage["energy"]
-                out["local"] = {"chip_j": e["soc_j"], "ai_j": e["ai_j"]}
+                # Electricity over the same span as the tokens. Power has been measured for only part of it
+                # (it started later than token counting), so the rest is filled in at the measured average.
+                span = out["days"] * 86400
+                measured = e["measured_seconds"]
+                scale = max(1.0, span / measured) if measured else None
+                out["local"] = {
+                    "chip_j": round(e["soc_j"] * scale, 1) if scale else None,
+                    "system_j": round(e["system_j"] * scale, 1) if scale and e["system_j"] is not None else None,
+                    "measured_hours": round(measured / 3600, 2), "period_hours": round(span / 3600, 2),
+                    "system_overhead_w": e["system_overhead_w"],
+                }
                 return self._json(out)
             if url.path == "/api/v1/usage/summary":
                 try:

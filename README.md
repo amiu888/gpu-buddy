@@ -68,6 +68,13 @@ gpud reads the chip's own energy counters (IOReport, the same source as `powerme
 | J per token (average) | AI energy ÷ generated tokens, prompt reading included |
 | energy per model | GPU energy is assigned to the models that produced the tokens, kept forever per hour |
 
+The whole Mac is measured too, from its power controller (the SMC's total system power, also without sudo). On a Mac Studio the fans, SSD, ports and network add about 9 W on top of the chip. The ledger shows two electricity rows next to the cloud prices:
+
+- **Chip only**
+- **Whole Mac (at the wall)**: the SMC reading plus ~10% power-supply loss
+
+If power was measured for only part of a period (for example, before the update that added it), the rest is filled in at the measured average power, and the ledger says so.
+
 The Token Ledger shows GPU and whole-chip energy for any period, the energy that went into tokens, what the chip's electricity cost (set your price per kWh), and what the same tokens would cost on the Claude API at list prices. The whole Mac at the wall uses more than the chip: fans, SSD, display and power-supply losses aren't included.
 
 ## What would the cloud cost?

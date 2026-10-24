@@ -82,6 +82,7 @@ struct Snapshot: Decodable {
         let soc_w: Double?
         let ai_w: Double?
         let gpu_peak_w: Double?
+        let system_w: Double?
         let j_per_token: Double?
         let tokens_per_wh: Double?
         let gpu_wh_24h: Double?
@@ -1420,8 +1421,9 @@ struct PowerCard: View {
     var body: some View {
         HStack(spacing: 6) {
             stat("⚡ GPU", power?.gpu_w.map { String(format: $0 < 10 ? "%.1f W" : "%.0f W", $0) },
-                 power?.gpu_peak_w.map { "peak \(Int($0)) W" })
-            stat("🔌 CHIP", power?.soc_w.map { String(format: "%.0f W", $0) }, power?.cpu_w.map { "CPU \(Int($0)) W" })
+                 power?.gpu_peak_w.map { "peak " + String(format: $0 < 10 ? "%.1f W" : "%.0f W", $0) })
+            stat("🔌 CHIP", power?.soc_w.map { String(format: "%.0f W", $0) },
+                 power?.system_w.map { "whole Mac \(Int($0)) W" } ?? power?.cpu_w.map { "CPU \(Int($0)) W" })
             stat("🍃 PER TOKEN", perToken, perTokenSub)
         }
         .help(breakdown)
@@ -1459,6 +1461,7 @@ struct PowerCard: View {
         let w = { (v: Double?) in String(format: "%.1f W", v ?? 0) }
         var lines = ["GPU \(w(p.gpu_w)) · CPU \(w(p.cpu_w)) · Neural Engine \(w(p.ane_w))",
                      "Memory \(w(p.dram_w)) · rest of the chip \(w(p.other_w)) · total \(w(p.soc_w))"]
+        if let sys = p.system_w { lines.append("Whole Mac (power controller): \(w(sys)), about \(w(sys / 0.9)) at the wall") }
         if let ai = p.ai_w, ai > 0 { lines.append("Local LLM servers are using \(w(ai)) of GPU power") }
         if let j = p.j_per_token { lines.append(String(format: "Right now: %.2f J per generated token", j)) }
         if let g = p.gpu_wh_24h {
@@ -1467,7 +1470,7 @@ struct PowerCard: View {
             lines.append(l)
         }
         if let j = p.j_per_token_24h { lines.append(String(format: "24h average: %.2f J per generated token (prompt reading included)", j)) }
-        lines.append("Measured from the chip's own energy counters. The whole Mac at the wall uses more.")
+        lines.append("Chip numbers come from its own energy counters; the whole Mac from its power controller (SMC).")
         return lines.joined(separator: "\n")
     }
 }
@@ -2448,6 +2451,7 @@ struct Usage: Decodable {
     struct Energy: Decodable {
         let gpu_j: Double
         let soc_j: Double
+        let system_j: Double?
         let ai_j: Double
         let measured_seconds: Double
         let j_per_token: Double?
@@ -2479,10 +2483,19 @@ struct CloudCost: Decodable {
         let note: String?
         var id: String { provider + model }
     }
+    /// Electricity over the same span, with unmeasured hours filled in at the measured average.
+    struct Local: Decodable {
+        let chip_j: Double?
+        let system_j: Double?
+        let measured_hours: Double
+        let period_hours: Double
+        let system_overhead_w: Double?
+    }
     let as_of: String?
     let sources: [String]
     let days: Double
     let models: [Row]
+    let local: Local?
 }
 
 struct UsageSummary: Decodable {
@@ -2538,14 +2551,17 @@ final class Ledger: ObservableObject {
     @Published private(set) var online = true
 
     let hostName: String
+    /// "Mac Studio", for labelling its electricity.
+    let machine: String
     private let client: APIClient
     private let cal = Calendar.current
     private var timer: Timer?
     private var task: Task<Void, Never>?
 
-    init(client: APIClient, hostName: String) {
+    init(client: APIClient, hostName: String, machine: String = "Mac") {
         self.client = client
         self.hostName = hostName
+        self.machine = machine
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] t in
             guard let self else { return t.invalidate() }
@@ -2806,8 +2822,8 @@ struct LedgerView: View {
                      measured ? "whole chip \(energyText(e?.soc_j ?? 0))" : "no power data yet", orange)
                 tile("🤖 FOR TOKENS", measured ? e.map { energyText($0.ai_j) } : nil,
                      e?.j_per_token.map { String(format: "%.2f J / token", $0) } ?? " ", orange)
-                tile("💡 ELECTRICITY", measured ? e.map { moneyText($0.soc_j / 3.6e6 * kwhPrice) } : nil,
-                     "chip, at $\(String(format: "%.2f", kwhPrice))/kWh", orange)
+                tile("💡 ELECTRICITY", measured ? e.map { moneyText(($0.system_j.map { $0 / psuEfficiency } ?? $0.soc_j) / 3.6e6 * kwhPrice) } : nil,
+                     (e?.system_j != nil ? "whole Mac" : "chip") + ", at $\(String(format: "%.2f", kwhPrice))/kWh", orange)
             }
             HStack(spacing: 4) {
                 Text("Electricity price $").font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.5))
@@ -2827,7 +2843,11 @@ struct LedgerView: View {
     private var cloudCost: some View {
         let all = ledger.cloud?.models ?? []
         let rows = region == "all" ? all : all.filter { $0.region == region }
-        let localCost = (ledger.usage?.energy?.soc_j ?? 0) / 3.6e6 * kwhPrice
+        let local = ledger.cloud?.local
+        // Power supplies lose roughly 10% as heat, so the wall meter reads a bit more than the SMC.
+        let chipCost = (local?.chip_j ?? 0) / 3.6e6 * kwhPrice
+        let macCost = local?.system_j.map { $0 / psuEfficiency / 3.6e6 * kwhPrice }
+        let localCost = macCost ?? chipCost
         let days = ledger.cloud?.days ?? 1
         return VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline) {
@@ -2883,13 +2903,20 @@ struct LedgerView: View {
                           + (r.note.map { "\n\($0)" } ?? ""))
                 }
                 Divider().overlay(Color.white.opacity(0.1))
-                HStack {
-                    Text("🖥 Your Mac (chip electricity)").frame(maxWidth: .infinity, alignment: .leading)
-                    Text(moneyText(localCost)).foregroundColor(orange).frame(width: 70, alignment: .trailing)
-                    Text(moneyText(days >= 28 ? localCost / days : localCost / days * 30)).foregroundColor(.white.opacity(0.6))
-                        .frame(width: 66, alignment: .trailing)
+                localRow("🧠 \(ledger.machine) chip only", chipCost, days,
+                         help: "Electricity for the M-series chip (CPU, GPU, Neural Engine, memory) from its energy counters.")
+                if let macCost {
+                    localRow("🖥 Whole \(ledger.machine) (at the wall)", macCost, days,
+                             help: "The whole computer as its power controller (SMC) measures it, plus ~10% power-supply loss. "
+                                 + (local?.system_overhead_w.map { String(format: "Fans, SSD, ports and network add about %.1f W on top of the chip. ", $0) } ?? "")
+                                 + "A monitor or other devices plugged in elsewhere aren't included.")
                 }
-                .font(.system(size: 10, weight: .bold, design: .rounded)).monospacedDigit()
+                if let l = local, l.measured_hours + 0.05 < l.period_hours {
+                    Text(String(format: "⚡ Power measured for %.1f of these %.1f hours; the rest is filled in at the same average power.",
+                                l.measured_hours, l.period_hours))
+                        .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.45))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if let mid = rows.first(where: { $0.model.contains("Sonnet") || $0.model.contains("DeepSeek V4 Pro") })
                     ?? rows.dropFirst(rows.count / 2).first {
                     Text("💰 Running locally saved about \(moneyText(max(0, mid.cost - localCost))) vs \(mid.model) in this period"
@@ -2907,6 +2934,19 @@ struct LedgerView: View {
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 12).fill(.white.opacity(0.05)))
+    }
+
+    private let psuEfficiency = 0.9
+
+    private func localRow(_ title: String, _ cost: Double, _ days: Double, help: String) -> some View {
+        HStack {
+            Text(title).lineLimit(1).minimumScaleFactor(0.8).frame(maxWidth: .infinity, alignment: .leading)
+            Text(moneyText(cost)).foregroundColor(orange).frame(width: 70, alignment: .trailing)
+            Text(moneyText(days >= 28 ? cost / days : cost / days * 30)).foregroundColor(.white.opacity(0.6))
+                .frame(width: 66, alignment: .trailing)
+        }
+        .font(.system(size: 10, weight: .bold, design: .rounded)).monospacedDigit()
+        .help(help)
     }
 
     private func costSlider(_ title: String, value: Binding<Double>, range: ClosedRange<Double>, text: String, help: String) -> some View {
@@ -3260,7 +3300,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func ledgerContent() -> NSView {
-        let ledger = Ledger(client: fleet.current.client, hostName: fleet.current.host.title)
+        let ledger = Ledger(client: fleet.current.client, hostName: fleet.current.host.title,
+                            machine: fleet.current.snap?.host?.model_name ?? "Mac")
         return NSHostingView(rootView: LedgerView(ledger: ledger))
     }
 

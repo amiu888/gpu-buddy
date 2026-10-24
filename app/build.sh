@@ -12,7 +12,7 @@ swiftc -O -swift-version 5 -target arm64-apple-macos14.0 -o "$APP/Contents/MacOS
 # The background service: gpud plus a prebuilt power helper, so users need no compiler.
 cp ../daemon/gpud.py ../daemon/gpupower.c ../daemon/prices.json "$APP/Contents/Resources/daemon/"
 clang -O2 -arch arm64 -mmacosx-version-min=14.0 -o "$APP/Contents/Resources/daemon/gpupower" \
-    ../daemon/gpupower.c -framework CoreFoundation -lIOReport
+    ../daemon/gpupower.c -framework CoreFoundation -framework IOKit -lIOReport
 
 # Icon: Chippy, drawn by the app itself.
 ICONSET="$(mktemp -d)/AppIcon.iconset"

@@ -4,11 +4,13 @@
 // energy used in each interval into watts:
 //   {"dt": 1.0, "gpu_w": 42.5, "cpu_w": 10.1, "ane_w": 0.0, "dram_w": 8.3, "other_w": 14.7}
 // "other" is the rest of the chip: fabric, memory controller, display, media engines.
+// "system_w" is the whole Mac as the SMC's power sensor sees it (PSTR), or null where there isn't one.
 //
-// Build: clang -O2 -o gpupower gpupower.c -framework CoreFoundation -lIOReport
+// Build: clang -O2 -o gpupower gpupower.c -framework CoreFoundation -framework IOKit -lIOReport
 // Run:   ./gpupower [interval seconds]
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +29,40 @@ extern int64_t IOReportSimpleGetIntegerValue(CFDictionaryRef, int32_t);
 // Top-level blocks of the chip besides CPU, GPU, ANE and DRAM. Sub-channels (per core, per
 // cluster) are left out so nothing is counted twice.
 static const char *OTHER[] = {"AFR", "ISP", "AVE", "MSR", "AMCC", "DCS", "DISP", "DISPEXT", "PMP", "SIO", "NPU", NULL};
+
+// The SMC's struct interface (as used by every fan/power monitor); reading keys needs no privileges.
+typedef struct { char major, minor, build, reserved[1]; unsigned short release; } SMCVers;
+typedef struct { unsigned short version, length; unsigned int cpuPLimit, gpuPLimit, memPLimit; } SMCPLimit;
+typedef struct { unsigned int dataSize, dataType; char dataAttributes; } SMCKeyInfo;
+typedef struct {
+    unsigned int key;
+    SMCVers vers;
+    SMCPLimit pLimitData;
+    SMCKeyInfo keyInfo;
+    char result, status, data8;
+    unsigned int data32;
+    unsigned char bytes[32];
+} SMCParam;
+
+static io_connect_t smc;
+
+/// Total system power in watts from the SMC key PSTR, or -1 if this Mac doesn't have it.
+static double system_watts(void) {
+    if (!smc) return -1;
+    SMCParam in = {0}, out = {0};
+    size_t size = sizeof out;
+    in.key = ('P' << 24) | ('S' << 16) | ('T' << 8) | 'R';
+    in.data8 = 9;  // key info
+    if (IOConnectCallStructMethod(smc, 2, &in, sizeof in, &out, &size) || out.result) return -1;
+    if (out.keyInfo.dataType != (('f' << 24) | ('l' << 16) | ('t' << 8) | ' ')) return -1;
+    in.keyInfo.dataSize = out.keyInfo.dataSize;
+    in.data8 = 5;  // read
+    size = sizeof out;
+    if (IOConnectCallStructMethod(smc, 2, &in, sizeof in, &out, &size) || out.result) return -1;
+    float w;
+    memcpy(&w, out.bytes, sizeof w);
+    return w;
+}
 
 static double joules(CFDictionaryRef ch) {
     char unit[16] = "";
@@ -61,10 +97,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"));
+    if (svc && IOServiceOpen(svc, mach_task_self(), 0, &smc) != KERN_SUCCESS) smc = 0;
+
     CFDictionaryRef prev = IOReportCreateSamples(sub, subbed, NULL);
     double t0 = now();
     for (;;) {
-        usleep((useconds_t)(interval * 1e6));
+        // PSTR is instantaneous, so average a few readings across the interval.
+        double sys = 0;
+        int n = 0;
+        for (int i = 0; i < 4; i++) {
+            usleep((useconds_t)(interval * 1e6 / 4));
+            double w = system_watts();
+            if (w >= 0) {
+                sys += w;
+                n++;
+            }
+        }
         CFDictionaryRef cur = IOReportCreateSamples(sub, subbed, NULL);
         double t1 = now(), dt = t1 - t0;
         CFDictionaryRef delta = IOReportCreateSamplesDelta(prev, cur, NULL);
@@ -90,8 +139,10 @@ int main(int argc, char **argv) {
         }
         CFRelease(delta);
         if (gpu == 0) gpu = gpu_mj;
-        printf("{\"dt\": %.4f, \"gpu_w\": %.3f, \"cpu_w\": %.3f, \"ane_w\": %.3f, \"dram_w\": %.3f, \"other_w\": %.3f}\n",
-               dt, gpu / dt, cpu / dt, ane / dt, dram / dt, other / dt);
+        char system[32] = "null";
+        if (n) snprintf(system, sizeof system, "%.3f", sys / n);
+        printf("{\"dt\": %.4f, \"gpu_w\": %.3f, \"cpu_w\": %.3f, \"ane_w\": %.3f, \"dram_w\": %.3f, \"other_w\": %.3f, "
+               "\"system_w\": %s}\n", dt, gpu / dt, cpu / dt, ane / dt, dram / dt, other / dt, system);
         fflush(stdout);
     }
 }
