@@ -72,7 +72,12 @@ The Token Ledger shows GPU and whole-chip energy for any period, the energy that
 
 ## What would the cloud cost?
 
-The Token Ledger estimates what the same tokens would have cost on frontier cloud models: Claude (Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5), OpenAI (GPT-6 Astra, GPT-5.5, GPT-6.1 Sol, GPT-6 Luna) and Google (Gemini 4 Argon, 3.1 Pro, 3.8 Flash). It shows the cost for the period, a 30-day projection at that pace, and how much running locally saved compared with your chip's electricity.
+The Token Ledger estimates what the same tokens would have cost on frontier cloud models:
+
+- **US providers:** Claude (Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5), OpenAI (GPT-6 Astra, GPT-5.5, GPT-6.1 Sol, GPT-6 Luna) and Google (Gemini 4 Argon, 3.1 Pro, 3.8 Flash).
+- **Chinese providers**, at their international USD prices: DeepSeek (V4 Pro, V4.1 Flash), Alibaba Qwen (3.8 Max, 3.7 Plus, 3.8 Flash), Moonshot Kimi K3, Zhipu GLM-5.3 and MiniMax M3.
+
+Use the **All / US / China** switch to narrow the table. It shows the cost for the period, a 30-day projection at that pace, and how much running locally saved compared with your chip's electricity.
 
 How it estimates:
 

@@ -2475,6 +2475,7 @@ struct CloudCost: Decodable {
         let input: Double
         let cache_read: Double
         let output: Double
+        let region: String?
         let note: String?
         var id: String { provider + model }
     }
@@ -2634,6 +2635,13 @@ final class Ledger: ObservableObject {
     }
 }
 
+/// "Oct 23, 9 PM"
+func sinceText(_ t: Double) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "MMM d, h a"
+    return f.string(from: Date(timeIntervalSince1970: t))
+}
+
 /// 1234567 -> "1,234,567"
 func fullCount(_ v: Double) -> String {
     let f = NumberFormatter()
@@ -2678,6 +2686,11 @@ struct LedgerView: View {
 
             Text(ledger.title)
                 .font(.system(size: 11, weight: .bold, design: .rounded)).foregroundColor(.white.opacity(0.6))
+            if let first = ledger.usage?.first_recorded, first > ledger.period.start.timeIntervalSince1970 {
+                Text("📅 Counting started \(sinceText(first)). Earlier days in this period have no data yet.")
+                    .font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(.orange.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             totals
             energy
@@ -2808,9 +2821,12 @@ struct LedgerView: View {
         }
     }
 
+    @AppStorage("cost.region") private var region = "all"
+
     // What the same tokens would have cost on frontier cloud models, under adjustable assumptions.
     private var cloudCost: some View {
-        let rows = ledger.cloud?.models ?? []
+        let all = ledger.cloud?.models ?? []
+        let rows = region == "all" ? all : all.filter { $0.region == region }
         let localCost = (ledger.usage?.energy?.soc_j ?? 0) / 3.6e6 * kwhPrice
         let days = ledger.cloud?.days ?? 1
         return VStack(alignment: .leading, spacing: 6) {
@@ -2832,6 +2848,12 @@ struct LedgerView: View {
             costSlider("Tokenizer", value: $ledger.tokenizer, range: 0.8...1.4, text: String(format: "%.2f×", ledger.tokenizer),
                        help: "The same text is a different number of tokens on each model family. 1.00× uses your local model's counts; "
                            + "newer Claude tokenizers can count up to ~1.35× more.")
+            Picker("", selection: $region) {
+                Text("All models").tag("all")
+                Text("🇺🇸 US").tag("us")
+                Text("🇨🇳 China").tag("cn")
+            }
+            .pickerStyle(.segmented).labelsHidden()
             Toggle(isOn: $ledger.batch) {
                 Text("Batch API (50% off, results within 24h: fine for work nobody waits on)")
                     .font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.7))
@@ -2850,7 +2872,7 @@ struct LedgerView: View {
                 .font(.system(size: 8, weight: .black, design: .rounded)).foregroundColor(.white.opacity(0.45))
                 ForEach(rows) { r in
                     HStack {
-                        Text(r.provider).foregroundColor(.white.opacity(0.45)).frame(width: 56, alignment: .leading)
+                        Text(r.provider).foregroundColor(.white.opacity(0.45)).lineLimit(1).frame(width: 60, alignment: .leading)
                         Text(r.model).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                         Text(moneyText(r.cost)).foregroundColor(gold).frame(width: 70, alignment: .trailing)
                         Text(moneyText(days >= 28 ? r.per_day : r.per_month)).foregroundColor(.white.opacity(0.6))
@@ -2868,13 +2890,15 @@ struct LedgerView: View {
                         .frame(width: 66, alignment: .trailing)
                 }
                 .font(.system(size: 10, weight: .bold, design: .rounded)).monospacedDigit()
-                if let mid = rows.first(where: { $0.model.contains("Sonnet") }) ?? rows.dropFirst(rows.count / 2).first {
+                if let mid = rows.first(where: { $0.model.contains("Sonnet") || $0.model.contains("DeepSeek V4 Pro") })
+                    ?? rows.dropFirst(rows.count / 2).first {
                     Text("💰 Running locally saved about \(moneyText(max(0, mid.cost - localCost))) vs \(mid.model) in this period"
                          + (days < 28 ? " (≈ \(moneyText(max(0, mid.per_month - localCost / days * 30))) a month at this pace)." : "."))
                         .font(.system(size: 10.5, weight: .bold, design: .rounded)).foregroundColor(gold)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                Text("Estimate: your prompt tokens priced as input and generated tokens as output, at list prices. "
+                Text("Estimate: your prompt tokens priced as input and generated tokens as output, at list prices"
+                     + (all.contains { $0.region == "cn" } ? " (Chinese providers at their international USD prices). " : ". ")
                      + "Long prompts (over 100K–272K tokens each) cost more on some models; yours are usually far below that. "
                      + "≈ 30 days projects the pace of this period.")
                     .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.45))

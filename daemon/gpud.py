@@ -1149,7 +1149,7 @@ def cloud_cost(usage, cache_hit=0.0, batch=False, thinking=0.0, tokenizer=1.0, r
         rows.append({"provider": m["provider"], "model": m["model"], "cost": round(cost, 4),
                      "per_day": round(cost / days, 4), "per_month": round(cost / days * 30, 2),
                      "input": m["input"], "cache_read": m["cache_read"], "output": m["output"],
-                     "note": m.get("note")})
+                     "region": m.get("region", ""), "note": m.get("note")})
     rows.sort(key=lambda r: r["cost"], reverse=True)
     return {"as_of": prices.get("as_of"), "sources": prices.get("sources", []), "days": round(days, 3),
             "tokens": {"prompt": usage["prompt"], "generated": usage["generated"]},
