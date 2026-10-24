@@ -5,7 +5,13 @@ Meet **Chippy**, a kitty-eared chip who runs as hard as your GPU does.
 - `daemon/gpud.py`: a daemon that reads Apple Silicon GPU stats from the IORegistry (no sudo needed) and serves them on `http://127.0.0.1:8765`. It uses only the Python standard library.
 - `app/GPUBuddy.swift`: a small native SwiftUI window that animates those stats. The Dock icon shows the live %.
 
-## Install
+## Download
+
+Get the DMG from [Releases](https://github.com/amiu888/gpu-buddy/releases/latest), drag GPU Buddy into Applications, and open it. It offers to install its background service. The build isn't notarized, so the first time use **System Settings → Privacy & Security → Open Anyway**. Requires an Apple Silicon Mac with macOS 14 or later.
+
+To make a DMG yourself, run `./release.sh`. It writes `dist/GPU-Buddy-<version>.dmg`.
+
+## Install from source
 
 ```bash
 ./install.sh                      # installs gpud as a launchd agent and builds the app

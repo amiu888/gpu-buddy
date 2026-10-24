@@ -54,7 +54,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 RETENTION_SECONDS = 24 * 3600
 STATE_DIR = os.path.expanduser("~/Library/Application Support/GPUBuddy")
 DEFAULT_DB = os.path.join(STATE_DIR, "history.db")
@@ -364,8 +364,13 @@ class PowerWatcher:
 
     @staticmethod
     def _binary():
-        """Path to gpupower, compiled from gpupower.c next to this file when missing or stale."""
-        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gpupower.c")
+        """Path to gpupower: the prebuilt one shipped next to this file (the app bundle has one), or
+        compiled from gpupower.c into STATE_DIR when missing or stale."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        src = os.path.join(here, "gpupower.c")
+        shipped = os.path.join(here, "gpupower")
+        if os.access(shipped, os.X_OK) and (not os.path.exists(src) or os.path.getmtime(shipped) >= os.path.getmtime(src)):
+            return shipped
         out = os.path.join(STATE_DIR, "gpupower")
         if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(src):
             os.makedirs(STATE_DIR, exist_ok=True)
@@ -452,7 +457,7 @@ class HistoryDB:
             PRIMARY KEY (hour, server, model))""")
         if not self.conn.execute("SELECT 1 FROM token_usage LIMIT 1").fetchone():
             # Seed it from the tokens already in the 24h history (server/model weren't recorded then).
-            self.conn.execute("""INSERT INTO token_usage
+            self.conn.execute("""INSERT INTO token_usage (hour, server, model, generated, prompt)
                 SELECT CAST(t / 3600 AS INTEGER) * 3600, '', '', SUM(tok_gen), SUM(tok_prompt)
                 FROM samples GROUP BY 1 HAVING SUM(tok_gen) + SUM(tok_prompt) > 0""")
         # energy_j: GPU+ANE joules spent producing these tokens; measured_gen: generated tokens it covers
@@ -1241,7 +1246,6 @@ def advertise(identity, port, info):
                             + [f"{k}={v}" for k, v in txt.items()],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     atexit.register(proc.terminate)
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # runs atexit, so the ad goes away with us
 
 
 def main():
@@ -1266,6 +1270,8 @@ def main():
         print(identity.pairing_code)
         return
 
+    # Exit through atexit on SIGTERM (launchctl stop/kickstart), so helpers and the Bonjour ad go too.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     tokens = TokenWatcher(args.interval)
     threading.Thread(target=tokens.loop, daemon=True).start()
     power = PowerWatcher(args.interval)

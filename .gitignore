@@ -2,3 +2,4 @@ app/GPU Buddy.app/
 __pycache__/
 *.pyc
 .DS_Store
+dist/

@@ -1412,7 +1412,10 @@ func bigNumber(_ v: Double) -> String {
 
 @MainActor func hype(_ store: GPUStore, tick: Int) -> String {
     guard store.online, let s = store.shown else {
-        if store.host.isLocal { return "I can't reach gpud. Run ./install.sh to wake me up 🔌" }
+        if store.host.isLocal {
+            return Service.isInstalled ? "gpud is starting… (logs: ~/Library/Logs/gpud.log) 🔌"
+                                       : "Install the background service (GPU Buddy menu) to wake me up 🔌"
+        }
         return "Can't reach \(store.host.name): \(store.problem ?? "offline") 🔌"
     }
     let top = s.processes.first?.label ?? "something"
@@ -1654,6 +1657,109 @@ struct DockIcon: View {
                 .foregroundColor(.white)
         }
         .frame(width: 256, height: 256)
+    }
+}
+
+/// The app's Finder/DMG icon: Chippy in the sky, on a rounded square.
+struct AppIcon: View {
+    var body: some View {
+        let anim = Anim()
+        let _ = (0..<45).forEach { anim.step(Date(timeIntervalSince1970: Double($0) / 30), util: 0.6, mem: 0.5, ai: true, tokS: 30) }
+        SceneCanvas(anim: anim, mood: "working")
+            .frame(width: 880, height: 880)
+            .clipShape(RoundedRectangle(cornerRadius: 196, style: .continuous))
+            .shadow(color: .black.opacity(0.35), radius: 18, y: 10)
+            .frame(width: 1024, height: 1024)
+    }
+}
+
+// MARK: - Background service (gpud) bundled inside the app
+
+/// Installs, updates and removes gpud as a LaunchAgent, from the copy bundled in the app.
+/// The files are copied to Application Support so the service keeps working wherever the app moves.
+@MainActor
+enum Service {
+    static let label = "local.gpubuddy.gpud"
+    static let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/GPUBuddy")
+    static let installed = support.appendingPathComponent("daemon")
+    static let plist = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    static var bundled: URL? { Bundle.main.resourceURL?.appendingPathComponent("daemon") }
+
+    /// gpud is set up by some means (this app, or ./install.sh from the repo).
+    static var isInstalled: Bool { FileManager.default.fileExists(atPath: plist.path) }
+
+    /// Set up by this app (as opposed to ./install.sh), so the app may update and remove it.
+    static var isOurs: Bool {
+        guard let d = NSDictionary(contentsOf: plist), let args = d["ProgramArguments"] as? [String] else { return false }
+        return args.contains { $0.hasPrefix(installed.path) }
+    }
+
+    static func version(at dir: URL) -> String? {
+        guard let src = try? String(contentsOf: dir.appendingPathComponent("gpud.py"), encoding: .utf8),
+              let line = src.split(separator: "\n").first(where: { $0.hasPrefix("VERSION = ") }) else { return nil }
+        return line.split(separator: "\"").dropFirst().first.map(String.init)
+    }
+
+    static func install() throws {
+        guard let bundled else { throw NSError(domain: "GPUBuddy", code: 1, userInfo: [NSLocalizedDescriptionKey: "This copy of GPU Buddy has no bundled gpud."]) }
+        let fm = FileManager.default
+        try fm.createDirectory(at: installed, withIntermediateDirectories: true)
+        for name in try fm.contentsOfDirectory(atPath: bundled.path) {
+            let dst = installed.appendingPathComponent(name)
+            try? fm.removeItem(at: dst)
+            try fm.copyItem(at: bundled.appendingPathComponent(name), to: dst)
+        }
+        let logs = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs")
+        try fm.createDirectory(at: plist.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: logs, withIntermediateDirectories: true)
+        let job: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": ["/usr/bin/python3", installed.appendingPathComponent("gpud.py").path, "--port", "8765"],
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "ProcessType": "Background",
+            "StandardOutPath": logs.appendingPathComponent("gpud.log").path,
+            "StandardErrorPath": logs.appendingPathComponent("gpud.log").path,
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: job, format: .xml, options: 0)
+        try data.write(to: plist)
+        launchctl(["bootout", "gui/\(getuid())/\(label)"])
+        launchctl(["bootstrap", "gui/\(getuid())", plist.path])
+    }
+
+    /// When the app carries a newer gpud than the one it installed, swap it in and restart it.
+    static func updateIfNeeded() {
+        guard isOurs, let bundled, let new = version(at: bundled), new != version(at: installed) else { return }
+        try? install()
+    }
+
+    static func uninstall() {
+        launchctl(["bootout", "gui/\(getuid())/\(label)"])
+        try? FileManager.default.removeItem(at: plist)
+    }
+
+    @discardableResult
+    private static func launchctl(_ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
+    /// /usr/bin/python3 needs Apple's Command Line Tools; without them macOS offers to install them.
+    static var hasCommandLineTools: Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        p.arguments = ["-p"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+        return p.terminationStatus == 0
     }
 }
 
@@ -2432,7 +2538,7 @@ struct LedgerView: View {
 // MARK: - App
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
     var window: NSWindow!
     var fleet: Fleet!
     var ledgerWindow: NSWindow?
@@ -2478,7 +2584,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         NSApp.mainMenu = makeMenu()
         NSApp.activate(ignoringOtherApps: true)
+        Service.updateIfNeeded()
         fleet.start()
+        if !Service.isInstalled && Service.bundled != nil && !UserDefaults.standard.bool(forKey: "skipServiceSetup") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.offerService(firstRun: true) }
+        }
+    }
+
+    /// Asks before installing gpud: it runs in the background and starts at login.
+    @objc func offerService(firstRun: Bool = false) {
+        let alert = NSAlert()
+        alert.messageText = "Install the GPU Buddy service?"
+        alert.informativeText = """
+            GPU Buddy reads your GPU through a small background service, gpud. It starts at login, uses about 1% CPU, \
+            and keeps 24 hours of GPU history plus your token and energy ledger on this Mac.
+
+            Other Macs can watch this one only with its pairing code, over an encrypted connection.
+            \(Service.hasCommandLineTools ? "" : "\nmacOS will ask to install the Command Line Developer Tools (for Python). Click Install; gpud starts by itself when they're ready.\n")
+            Only want to watch other Macs? Choose Not Now.
+            """
+        alert.addButton(withTitle: "Install")
+        alert.addButton(withTitle: "Not Now")
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            if firstRun { UserDefaults.standard.set(true, forKey: "skipServiceSetup") }
+            return
+        }
+        do {
+            try Service.install()
+            if !Service.hasCommandLineTools {
+                // Running python3 once makes macOS show its "install the tools" dialog.
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                p.arguments = ["--version"]
+                try? p.run()
+            }
+        } catch {
+            let fail = NSAlert(error: error)
+            fail.runModal()
+        }
+    }
+
+    @objc func removeService() {
+        let alert = NSAlert()
+        alert.messageText = "Remove the GPU Buddy service?"
+        alert.informativeText = "gpud stops and won't start at login. Your history and ledger stay in ~/Library/Application Support/GPUBuddy."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn { Service.uninstall() }
+    }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(offerService(firstRun:)): return Service.bundled != nil && !Service.isInstalled
+        case #selector(removeService): return Service.isOurs
+        default: return true
+        }
     }
 
     private func makeMenu() -> NSMenu {
@@ -2503,6 +2663,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             appMenu.addItem(item)
         }
         appMenu.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
+        appMenu.addItem(.separator())
+        for (title, action) in [("Install Background Service…", #selector(offerService(firstRun:))),
+                                ("Remove Background Service…", #selector(removeService))] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            appMenu.addItem(item)
+        }
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "Quit GPU Buddy", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appItem.submenu = appMenu
@@ -2603,6 +2770,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 }
 
 MainActor.assumeIsolated {
+    // Used by build.sh: `GPUBuddy --render-icon out.png` draws the app icon and exits.
+    if let i = CommandLine.arguments.firstIndex(of: "--render-icon"), i + 1 < CommandLine.arguments.count {
+        let r = ImageRenderer(content: AppIcon())
+        r.scale = 1
+        if let img = r.nsImage, let t = img.tiffRepresentation, let b = NSBitmapImageRep(data: t),
+           let png = b.representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+        }
+        exit(0)
+    }
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate
