@@ -48,6 +48,9 @@ func copyToClipboard(_ text: String) {
 let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
     .appendingPathComponent("GPUBuddy")
 
+/// Below this number of days, "per day" and "per month" values can be misleading.
+let MIN_PERIOD_DAYS = 7
+
 extension View {
     /// A fixed width on the Mac (small windows); the full screen width on iPhone and iPad.
     @ViewBuilder func panelWidth(_ width: CGFloat) -> some View {
@@ -135,6 +138,7 @@ struct Snapshot: Decodable {
         let ai_w: Double?
         let gpu_peak_w: Double?
         let system_w: Double?
+        let gpu_temp: Double?
         let j_per_token: Double?
         let tokens_per_wh: Double?
         let gpu_wh_24h: Double?
@@ -1451,13 +1455,34 @@ struct TokenCard: View {
     private let gold = Color(red: 1, green: 0.85, blue: 0.5)
 
     var body: some View {
-        HStack(spacing: 8) {
-            stat("✍️ GENERATED · 24h", tokens?.generated_24h, live: tokens.flatMap { $0.speed_tok_s > 0 ? "⚡\(Int($0.speed_tok_s)) tok/s" : nil })
-            stat("📖 USED · 24h", tokens?.prompt_24h, live: tokens.flatMap { $0.prompt_per_s > 0 ? "+\(shortCount($0.prompt_per_s))/s" : nil })
+        VStack(spacing: 4) {
+            // Model name banner — prominently shows which LLM is active.
+            if let src = tokens?.sources, !src.isEmpty, let model = activeModel(src), !model.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu").font(.system(size: 7.5, weight: .medium))
+                    Text(model).font(.system(size: 8, weight: .semibold, design: .rounded))
+                    Spacer()
+                }
+                .foregroundColor(.white.opacity(0.7))
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(RoundedRectangle(cornerRadius: 5).fill(gold.opacity(0.15)))
+            }
+            HStack(spacing: 8) {
+                stat("✍️ GENERATED · 24h", tokens?.generated_24h, live: tokens.flatMap { $0.speed_tok_s > 0 ? "⚡\(Int($0.speed_tok_s)) tok/s" : nil })
+                stat("📖 USED · 24h", tokens?.prompt_24h, live: tokens.flatMap { $0.prompt_per_s > 0 ? "+\(shortCount($0.prompt_per_s))/s" : nil })
+            }
         }
         .contentShape(Rectangle())
         .onTapGesture { onTap?() }
         .help(sourcesHelp + "\n\nClick for the Token Ledger (⌘L): today, this week, month, YTD, all time.")
+    }
+
+    private func activeModel(_ src: [Snapshot.Tokens.Source]) -> String? {
+        guard let active = src.first(where: { $0.tok_s > 0 }) else { return nil }
+        return active.model.isEmpty ? active.name : active.model
     }
 
     private func stat(_ title: String, _ value: Double?, live: String?) -> some View {
@@ -1504,12 +1529,17 @@ struct PowerCard: View {
     private let orange = Color(red: 1, green: 0.62, blue: 0.35)
 
     var body: some View {
-        HStack(spacing: 6) {
-            stat("⚡ GPU", power?.gpu_w.map { String(format: $0 < 10 ? "%.1f W" : "%.0f W", $0) },
-                 power?.gpu_peak_w.map { "peak " + String(format: $0 < 10 ? "%.1f W" : "%.0f W", $0) })
-            stat("🔌 CHIP", power?.soc_w.map { String(format: "%.0f W", $0) },
-                 power?.system_w.map { "whole Mac \(Int($0)) W" } ?? power?.cpu_w.map { "CPU \(Int($0)) W" })
-            stat("🍃 PER TOKEN", perToken, perTokenSub)
+        VStack(spacing: 4) {
+            HStack(spacing: 6) {
+                stat("⚡ GPU", power?.gpu_w.map { String(format: $0 < 10 ? "%.1f W" : "%.0f W", $0) },
+                     power?.gpu_peak_w.map { "peak " + String(format: $0 < 10 ? "%.1f W" : "%.0f W", $0) })
+                stat("🔌 CHIP", power?.soc_w.map { String(format: "%.0f W", $0) },
+                     power?.system_w.map { "whole Mac \(Int($0)) W" } ?? power?.cpu_w.map { "CPU \(Int($0)) W" })
+                if let t = power?.gpu_temp {
+                    stat("🌡️ GPU TEMP", "\(String(format: "%.0f °C", t))", nil)
+                }
+                stat("🍃 PER TOKEN", perToken, perTokenSub)
+            }
         }
         .help(breakdown)
     }
@@ -1984,6 +2014,7 @@ struct ContentView: View {
     @ObservedObject var fleet: Fleet
     @ObservedObject var characters: Characters
     var anim = Anim()
+    @State private var searchQuery = ""
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !store.visible)) { tl in
@@ -2101,7 +2132,17 @@ struct ContentView: View {
                 }
 
                 VStack(spacing: 4) {
-                    ForEach(topProcesses(s, 3)) { ProcessRow(p: $0) }
+                    #if os(macOS)
+                    TextField("Search processes…", text: $searchQuery)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.bottom, 2)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(.white.opacity(0.06)))
+                        .padding(.horizontal, 1)
+                    #endif
+                    ForEach(topProcesses(s, 3, filter: searchQuery)) { ProcessRow(p: $0) }
                 }
                 .frame(height: 84, alignment: .top)
 
@@ -2174,9 +2215,15 @@ struct ContentView: View {
         return String(format: "%.1f / %.0f GB · %.0f%%", s.memory.used_bytes / 1_073_741_824, s.memory.total_bytes / 1_073_741_824, s.memory.used_percent)
     }
 
-    private func topProcesses(_ s: Snapshot?, _ n: Int) -> [Snapshot.Proc] {
+    private func topProcesses(_ s: Snapshot?, _ n: Int, filter: String = "") -> [Snapshot.Proc] {
         guard store.online, let s else { return [] }
-        return Array(s.processes.filter { $0.gpu_percent >= 0.5 }.prefix(n))
+        let filtered = s.processes.filter { $0.gpu_percent >= 0.5 }
+        let searched = filter.isEmpty ? filtered : filtered.filter {
+            $0.name.localizedCaseInsensitiveContains(filter) ||
+            ($0.command ?? "").localizedCaseInsensitiveContains(filter) ||
+            ($0.activity ?? "").localizedCaseInsensitiveContains(filter)
+        }
+        return Array(searched.prefix(n))
     }
 }
 
@@ -2215,6 +2262,129 @@ struct AppIcon: View {
             .clipShape(RoundedRectangle(cornerRadius: 196, style: .continuous))
             .shadow(color: .black.opacity(0.35), radius: 18, y: 10)
             .frame(width: 1024, height: 1024)
+    }
+}
+
+// MARK: - About page
+
+#if os(macOS)
+struct AboutView: View {
+    let daemonVersion: String?
+    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.11.0"
+
+    var body: some View {
+        VStack(spacing: 16) {
+            AppIcon()
+                .frame(width: 160, height: 160)
+                .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
+
+            Text("GPU Buddy").font(.system(size: 22, weight: .heavy, design: .rounded)).foregroundColor(.white)
+            Text("Version \(appVersion)").font(.system(size: 12, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.6))
+
+            if let dv = daemonVersion {
+                Text("Daemon v\(dv)").font(.system(size: 11, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.4))
+            }
+
+            Text("Real-time GPU visualization for Apple Silicon Macs — with animated characters.").font(.system(size: 12, weight: .regular, design: .rounded))
+                .foregroundColor(.white.opacity(0.7))
+                .multilineTextAlignment(.center)
+
+            Divider().foregroundColor(.white.opacity(0.1))
+
+            VStack(alignment: .leading, spacing: 8) {
+                aboutRow("⚡ GPU", "Real-time GPU utilization with animated visualization")
+                aboutRow("🔌 Power", "GPU, CPU, ANE, DRAM, and total system power (no sudo)")
+                aboutRow("📊 Tokens", "AI token generation and cost estimation")
+                aboutRow("☁️ Cloud", "Compare local vs cloud frontier models")
+                aboutRow("🖥 Multi-Mac", "Pair and monitor multiple Macs over TLS")
+                aboutRow("🎭 Characters", "Chippy, Witch Bunny, and custom photo characters")
+            }
+
+            Spacer()
+        }
+        .padding(.top, titleBarInset)
+        .padding(.horizontal, 24)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func aboutRow(_ emoji: String, _ text: String) -> some View {
+        HStack(spacing: 8) {
+            Text(emoji).font(.system(size: 13, weight: .semibold))
+            Text(text).font(.system(size: 12, weight: .regular, design: .rounded)).foregroundColor(.white.opacity(0.7))
+        }
+    }
+}
+#else
+struct AboutView: View {
+    let daemonVersion: String?
+    var body: some View { Text("About not available on iOS") }
+}
+#endif
+
+// MARK: - Settings
+
+struct SettingsView: View {
+    @AppStorage("kwhPrice") private var kwhPrice = 0.15
+    @AppStorage("cost.cacheHit") private var cacheHit = 0.0
+    @AppStorage("cost.thinking") private var thinking = 0.0
+    @AppStorage("cost.tokenizer") private var tokenizer = 1.0
+    @AppStorage("cost.region") private var region = "all"
+    @AppStorage("cost.batch") private var batch = false
+    @AppStorage("skipServiceSetup") private var skipService = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("⚙️ Settings").font(.system(size: 17, weight: .heavy, design: .rounded))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, titleBarInset)
+                .background(WindowDragArea())
+
+            section("Energy & Cloud Cost") {
+                VStack(alignment: .leading, spacing: 12) {
+                    settingSlider("Electricity price", text: "$\(String(format: "%.2f", kwhPrice))", unit: "/kWh", value: $kwhPrice, range: 0.01...0.50)
+                    settingSlider("Prompt cache", text: "\(Int(cacheHit * 100))%", value: $cacheHit, range: 0...0.9)
+                    settingSlider("Hidden thinking", text: "+\(Int(thinking * 100))%", value: $thinking, range: 0...2)
+                    settingSlider("Tokenizer", text: String(format: "%.2f×", tokenizer), value: $tokenizer, range: 0.8...1.4)
+
+                    Toggle("Batch API (50% off, results within 24h)", isOn: $batch)
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .toggleStyle(.checkbox)
+
+                    Picker("Region", selection: $region) {
+                        Text("All models").tag("all")
+                        Text("🇺🇸 US").tag("us")
+                        Text("🇨🇳 China").tag("cn")
+                    }
+                    .pickerStyle(.segmented)
+                }
+            }
+
+            section("Appearance") {
+                Text("Character preferences and animations are handled within the app.").font(.system(size: 11, weight: .regular, design: .rounded)).foregroundColor(.white.opacity(0.6))
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func section(_ title: String, @ViewBuilder _ content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.system(size: 8.5, weight: .black, design: .rounded)).foregroundColor(.white.opacity(0.6))
+            content()
+        }
+    }
+
+    private func settingSlider(_ title: String, text: String, unit: String = "", value: Binding<Double>, range: ClosedRange<Double>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(title).frame(width: 120, alignment: .leading)
+                Slider(value: value, in: range).controlSize(.mini)
+                Text(text).monospacedDigit().frame(width: 40, alignment: .trailing)
+                if !unit.isEmpty { Text(unit).font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.4)) }
+            }
+        }
     }
 }
 
@@ -2947,7 +3117,7 @@ struct LedgerView: View {
                 HStack {
                     Text("MODEL").frame(maxWidth: .infinity, alignment: .leading)
                     Text("THIS PERIOD").frame(width: 70, alignment: .trailing)
-                    Text(days >= 28 ? "PER DAY" : "≈ 30 DAYS").frame(width: 66, alignment: .trailing)
+                    Text(days >= Double(MIN_PERIOD_DAYS) ? "PER DAY" : "≈ 30 DAYS").frame(width: 66, alignment: .trailing)
                 }
                 .font(.system(size: 8, weight: .black, design: .rounded)).foregroundColor(.white.opacity(0.45))
                 ForEach(rows) { r in
@@ -2955,7 +3125,7 @@ struct LedgerView: View {
                         Text(r.provider).foregroundColor(.white.opacity(0.45)).lineLimit(1).frame(width: 60, alignment: .leading)
                         Text(r.model).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                         Text(moneyText(r.cost)).foregroundColor(gold).frame(width: 70, alignment: .trailing)
-                        Text(moneyText(days >= 28 ? r.per_day : r.per_month)).foregroundColor(.white.opacity(0.6))
+                        Text(moneyText(days >= Double(MIN_PERIOD_DAYS) ? r.per_day : r.per_month)).foregroundColor(.white.opacity(0.6))
                             .frame(width: 66, alignment: .trailing)
                     }
                     .font(.system(size: 10, weight: .semibold, design: .rounded)).monospacedDigit()
@@ -2980,7 +3150,7 @@ struct LedgerView: View {
                 if let mid = rows.first(where: { $0.model.contains("Sonnet") || $0.model.contains("DeepSeek V4 Pro") })
                     ?? rows.dropFirst(rows.count / 2).first {
                     Text("💰 Running locally saved about \(moneyText(max(0, mid.cost - localCost))) vs \(mid.model) in this period"
-                         + (days < 28 ? " (≈ \(moneyText(max(0, mid.per_month - localCost / days * 30))) a month at this pace)." : "."))
+                         + (days < Double(MIN_PERIOD_DAYS) ? " (≈ \(moneyText(max(0, mid.per_month - localCost / days * 30))) a month at this pace)." : "."))
                         .font(.system(size: 10.5, weight: .bold, design: .rounded)).foregroundColor(gold)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -3002,7 +3172,7 @@ struct LedgerView: View {
         HStack {
             Text(title).lineLimit(1).minimumScaleFactor(0.8).frame(maxWidth: .infinity, alignment: .leading)
             Text(moneyText(cost)).foregroundColor(orange).frame(width: 70, alignment: .trailing)
-            Text(moneyText(days >= 28 ? cost / days : cost / days * 30)).foregroundColor(.white.opacity(0.6))
+            Text(moneyText(days >= Double(MIN_PERIOD_DAYS) ? cost / days : cost / days * 30)).foregroundColor(.white.opacity(0.6))
                 .frame(width: 66, alignment: .trailing)
         }
         .font(.system(size: 10, weight: .bold, design: .rounded)).monospacedDigit()

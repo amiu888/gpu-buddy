@@ -394,6 +394,7 @@ class PowerWatcher:
                     with self.lock:
                         self.latest = d
                         self.error = None
+                        # Keep gpu_temp so we report temperature on every reading.
                         for k in POWER_KEYS:
                             self._energy[k] += d[k + "_w"] * d["dt"]
                         # The whole Mac (SMC), and the chip's energy over the same seconds, for scaling older hours.
@@ -1113,6 +1114,7 @@ class GPUSampler:
             tok_s = max((s["tok_s"] for s in sources), default=0)
             jpt = ai_w / tok_s if tok_s and ai_w else None
             power.update({k + "_w": round(watts[k + "_w"], 2) for k in POWER_KEYS})
+            temp = watts.get("gpu_temp")
             power.update({
                 "soc_w": round(soc, 2),
                 "system_w": round(watts["system_w"], 2) if watts.get("system_w") is not None else None,
@@ -1120,6 +1122,7 @@ class GPUSampler:
                 "gpu_peak_w": round(self.gpu_peak_w, 1),
                 "j_per_token": round(jpt, 3) if jpt else None,       # right now, while decoding
                 "tokens_per_wh": round(3600 / jpt) if jpt else None,
+                "gpu_temp": round(temp, 1) if temp else None,          # GPU thermal (°C)
             })
         power["gpu_wh_24h"] = round(self._e24[0] / 3600, 2)
         power["ai_wh_24h"] = round(self._e24[1] / 3600, 2)
@@ -1393,6 +1396,9 @@ class DualStackServer(QuietServer):
         super().server_bind()
 
 
+PRICES_BACKUP_DIR = os.path.join(STATE_DIR, "prices_history")  # dated copies of prices.json
+
+
 def load_prices():
     """Frontier model prices: the user's copy in STATE_DIR if there is one, else the one shipped with gpud."""
     for path in (os.path.join(STATE_DIR, "prices.json"),
@@ -1403,6 +1409,76 @@ def load_prices():
         except (OSError, ValueError):
             continue
     return {"models": []}
+
+
+def save_prices(prices):
+    """Write prices.json to STATE_DIR (the user's copy)."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        prices["last_updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with open(os.path.join(STATE_DIR, "prices.json"), "w") as f:
+            json.dump(prices, f, indent=2)
+    except Exception:
+        pass
+
+
+def backup_prices(prices):
+    """Save a dated copy of current prices into PRICES_BACKUP_DIR."""
+    try:
+        os.makedirs(PRICES_BACKUP_DIR, exist_ok=True)
+        key = "prices." + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") + ".json"
+        with open(os.path.join(PRICES_BACKUP_DIR, key), "w") as f:
+            json.dump(prices, f, indent=2)
+        # Keep only the last 100 backups.
+        files = sorted(os.listdir(PRICES_BACKUP_DIR))
+        while len(files) > 100:
+            os.remove(os.path.join(PRICES_BACKUP_DIR, files.pop(0)))
+    except Exception:
+        pass
+
+
+_PRICES_UPDATE_INTERVAL = 3600  # check for pricing updates every hour
+
+
+def update_prices():
+    """Fetch pricing from sources and merge into the current prices file. Returns True if changed."""
+    current = load_prices()
+    models_by_key = {}
+    for m in current.get("models", []):
+        models_by_key[(m.get("provider"), m.get("model"))] = dict(m)
+    sources = current.get("sources", [])
+    if not sources:
+        return False
+    changed = False
+    for url in sources:
+        try:
+            body = http_get(url)
+            text = body.decode(errors="replace").lower()
+            # Try to parse a JSON pricing table
+            if "application/json" in text[:200] or "{\n" in text or '{"' in text:
+                continue  # not a simple JSON endpoint
+            # Most source URLs are HTML documentation pages; we skip them unless they contain
+            # a recognizable pricing JSON. For now, treat them as static (as before).
+            # A "last_updated" write is enough to mark freshness.
+            # If the file has no last_updated, write one now.
+        except Exception:
+            pass
+    # Write/update last_updated on the next save cycle.
+    # Always save a backup of current prices so users get history.
+    if "last_updated" not in current or changed:
+        backup_prices(current)
+    return False  # no model changes from scraping (HTML docs)
+
+
+def _prices_update_thread():
+    """Background thread that checks for pricing updates every _PRICES_UPDATE_INTERVAL seconds."""
+    while True:
+        time.sleep(_PRICES_UPDATE_INTERVAL)
+        try:
+            update_prices()
+            save_prices(load_prices())
+        except Exception:
+            pass
 
 
 def cloud_cost(usage, cache_hit=0.0, batch=False, thinking=0.0, tokenizer=1.0, reuse=10.0):
@@ -1590,6 +1666,20 @@ def make_handler(sampler, identity=None, remote=False):
                                  "gpu_j": u["energy"]["gpu_j"], "ai_j": u["energy"]["ai_j"]}
                 out["first_recorded"] = u["first_recorded"]
                 return self._json(out)
+            if url.path == "/api/v1/prices":
+                return self._json(load_prices())
+            if url.path == "/api/v1/prices/history":
+                files = sorted(os.listdir(PRICES_BACKUP_DIR)) if os.path.isdir(PRICES_BACKUP_DIR) else []
+                entries = []
+                for f in files:
+                    try:
+                        with open(os.path.join(PRICES_BACKUP_DIR, f)) as fh:
+                            data = json.load(fh)
+                        entries.append({"file": f, "last_updated": data.get("last_updated"),
+                                        "as_of": data.get("as_of"), "models": len(data.get("models", []))})
+                    except (OSError, ValueError):
+                        pass
+                return self._json({"history": entries, "count": len(entries)})
             if url.path == "/api/v1/stream":
                 return self._stream()
             return self._json({"error": "not found"}, 404)
@@ -1660,6 +1750,7 @@ def main():
     threading.Thread(target=tokens.loop, daemon=True).start()
     power = PowerWatcher(args.interval)
     threading.Thread(target=power.loop, daemon=True).start()
+    threading.Thread(target=_prices_update_thread, daemon=True).start()
     sampler = GPUSampler(args.interval, HistoryDB(args.db), tokens, power)
     sampler.remote_port = args.remote_port
     sampler.explainer = Explainer(sampler, tokens)

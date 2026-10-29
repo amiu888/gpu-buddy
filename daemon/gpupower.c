@@ -139,10 +139,24 @@ int main(int argc, char **argv) {
         }
         CFRelease(delta);
         if (gpu == 0) gpu = gpu_mj;
+        // Read GPU thermal (temperature in Celsius) if the channel exists.
+        double gpu_temp = 0;
+        CFArrayRef tmp = CFDictionaryGetValue(delta, CFSTR("IOReportChannels"));
+        for (CFIndex i = 0; tmp && i < CFArrayGetCount(tmp); i++) {
+            CFDictionaryRef ch = CFArrayGetValueAtIndex(tmp, i);
+            char tname[128] = "";
+            CFStringGetCString(IOReportChannelGetChannelName(ch), tname, sizeof tname, kCFStringEncodingUTF8);
+            if (!strcmp(tname, "GPU-Temperature")) {
+                gpu_temp = (double)IOReportSimpleGetIntegerValue(ch, 0) / 1000.0; // mC to C
+            }
+        }
         char system[32] = "null";
         if (n) snprintf(system, sizeof system, "%.3f", sys / n);
+        char temp[32] = "null";
+        if (gpu_temp > 0) snprintf(temp, sizeof temp, "%.1f", gpu_temp / dt);
         printf("{\"dt\": %.4f, \"gpu_w\": %.3f, \"cpu_w\": %.3f, \"ane_w\": %.3f, \"dram_w\": %.3f, \"other_w\": %.3f, "
-               "\"system_w\": %s}\n", dt, gpu / dt, cpu / dt, ane / dt, dram / dt, other / dt, system);
+               "\"system_w\": %s, \"gpu_temp\": %s}\n", dt, gpu / dt, cpu / dt, ane / dt, dram / dt, other / dt,
+               system, temp);
         fflush(stdout);
     }
 }

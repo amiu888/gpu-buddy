@@ -101,6 +101,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var window: NSWindow!
     var fleet: Fleet!
     let characters = Characters()
+    var aboutWindow: NSWindow?
+    var settingsWindow: NSWindow?
     var ledgerWindow: NSWindow?
     var macsWindow: NSWindow?
     private var port = 8765
@@ -223,6 +225,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             item.target = self
             appMenu.addItem(item)
         }
+        let about = NSMenuItem(title: "About GPU Buddy…", action: #selector(openAbout), keyEquivalent: "?")
+        about.target = self
+        appMenu.addItem(about)
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: "s")
+        settings.target = self
+        appMenu.addItem(settings)
         appMenu.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
         appMenu.addItem(.separator())
         for (title, action) in [("Install Background Service…", #selector(offerService(firstRun:))),
@@ -293,6 +301,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             macsWindow = w
         }
         macsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func openAbout() {
+        if aboutWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 480),
+                             styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+            w.titlebarAppearsTransparent = true
+            w.titleVisibility = .hidden
+            w.title = "About GPU Buddy"
+            w.isReleasedWhenClosed = false
+            w.backgroundColor = window.backgroundColor
+            w.appearance = NSAppearance(named: .darkAqua)
+            w.contentView = NSHostingView(rootView: AboutView(daemonVersion: fleet.current.snap?.host?.gpud_version))
+            w.center()
+            aboutWindow = w
+        }
+        aboutWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func openSettings() {
+        if settingsWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 420),
+                             styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+            w.titlebarAppearsTransparent = true
+            w.titleVisibility = .hidden
+            w.title = "Settings"
+            w.isReleasedWhenClosed = false
+            w.backgroundColor = window.backgroundColor
+            w.appearance = NSAppearance(named: .darkAqua)
+            w.contentView = NSHostingView(rootView: SettingsView())
+            w.center()
+            settingsWindow = w
+        }
+        settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc func nextMac() { fleet.step(1) }

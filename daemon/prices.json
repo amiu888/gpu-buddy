@@ -1,5 +1,6 @@
 {
   "as_of": "2026-10-24",
+  "last_updated": "2026-10-28T09:00:00Z",
   "unit": "USD per 1M tokens, standard tier, global routing",
   "sources": [
     "https://platform.claude.com/docs/en/about-claude/pricing",
