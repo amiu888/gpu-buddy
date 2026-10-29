@@ -68,6 +68,8 @@ gpud finds local LLM servers by looking for AI-looking processes that listen on 
 
 **Generated** = output tokens written by the model. **Used** = prompt tokens it read. Both are counted while gpud is running.
 
+**Time to first token** = how long the model took to start answering, which is mostly the time spent reading the prompt. The app shows it next to the model name (`⏱ 1st token 2.4 s · avg 1.8 s`): the latest request, and the average over the server's recent requests. It comes from `ttft_s` in an MLX server's `/metrics`, or the `time_to_first_token_seconds` histogram for vLLM and SGLang (average only). In the API it's `tokens.ttft_s`, `tokens.ttft_avg_s` and `tokens.ttft_model`, plus `ttft_s` / `ttft_avg_s` on each source.
+
 Token usage is kept **forever**, per hour and per model, so the Token Ledger can show any period. Weeks start on the day your Mac's calendar uses (`week_start=1` for Sunday, `2` for Monday in the API).
 
 ## Power

@@ -118,12 +118,21 @@ struct Snapshot: Decodable {
             let in_flight: Double?
             let generated_total: Double?
             let prompt_total: Double?
+            let ttft_s: Double?      // time to first token of the server's latest request
+            let ttft_avg_s: Double?  // average over its recent requests
         }
         let generated_per_s: Double
         let prompt_per_s: Double
         let generated_24h: Double
         let prompt_24h: Double
         let speed_tok_s: Double
+        // Time to first token of the most recent request on any server (nil from older gpud versions).
+        let ttft_s: Double?
+        let ttft_avg_s: Double?
+        let ttft_model: String?
+        let ttft_prompt_tokens: Double?  // prompt size of that request (first-token time mostly depends on it)
+        let ttft_cache: Bool?            // the server's prompt cache was on for it
+        let ttft_samples: Double?        // requests in the average (same model and cache setting)
         let sources: [Source]
     }
     struct Power: Decodable {
@@ -854,6 +863,8 @@ struct SceneCanvas: View {
     let mood: String
     var badge: String? = nil
     var character: CharacterKind = .chippy
+    /// Full view: the temperature and first-token badges sit top-left, so the character moves a little right and shrinks a touch.
+    var roomForBadges = false
 
     var body: some View {
         Canvas { ctx, size in
@@ -1275,7 +1286,13 @@ struct SceneCanvas: View {
         }
 
         let groundY = h - 22
-        let cx = w * 0.5
+        let cx = w * (roomForBadges ? 0.56 : 0.5)  // a little right of center when the badges are showing
+        // The character and its effects (speed lines, shadow, sweat, z's, hearts) are drawn a touch smaller,
+        // scaled around the spot where it stands.
+        var cg = ctx
+        cg.translateBy(x: cx, y: groundY)
+        cg.scaleBy(x: roomForBadges ? 0.9 : 1, y: roomForBadges ? 0.9 : 1)
+        cg.translateBy(x: -cx, y: -groundY)
 
         // Rolling grassy hill + treadmill dashes.
         ctx.fill(Path(roundedRect: CGRect(x: -20, y: groundY, width: w + 40, height: 60), cornerRadius: 24),
@@ -1298,22 +1315,22 @@ struct SceneCanvas: View {
                 var p = Path()
                 p.move(to: CGPoint(x: lx, y: y))
                 p.addLine(to: CGPoint(x: lx - len, y: y))
-                ctx.stroke(p, with: .color(.white.opacity(0.5 * (1 - travel / 120))), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                cg.stroke(p, with: .color(.white.opacity(0.5 * (1 - travel / 120))), style: StrokeStyle(lineWidth: 2, lineCap: .round))
             }
         }
 
         let bob = sleeping ? sin(t * 1.6) * 1.5 : abs(sin(a.runPhase * .pi * 2)) * (2 + 5 * u)
-        ctx.fill(Path(ellipseIn: CGRect(x: cx - 30 + bob, y: groundY - 3, width: 60 - bob * 2, height: 7)), with: .color(.black.opacity(0.25)))
+        cg.fill(Path(ellipseIn: CGRect(x: cx - 30 + bob, y: groundY - 3, width: 60 - bob * 2, height: 7)), with: .color(.black.opacity(0.25)))
 
         let c: GraphicsContext
         let body: CGRect
         switch character {
         case .chippy:
-            (c, body) = drawChippy(ctx, cx: cx, groundY: groundY, bob: bob, sleeping: sleeping, offline: offline)
+            (c, body) = drawChippy(cg, cx: cx, groundY: groundY, bob: bob, sleeping: sleeping, offline: offline)
         case .bunny:
-            (c, body) = (ctx, drawBunny(ctx, cx: cx, groundY: groundY, sleeping: sleeping, offline: offline))
+            (c, body) = (cg, drawBunny(cg, cx: cx, groundY: groundY, sleeping: sleeping, offline: offline))
         case .photo(let image):
-            (c, body) = (ctx, drawPhoto(ctx, image, cx: cx, groundY: groundY, sleeping: sleeping, offline: offline))
+            (c, body) = (cg, drawPhoto(cg, image, cx: cx, groundY: groundY, sleeping: sleeping, offline: offline))
         }
         // Sparkles rise from above the head (and above the bunny's hat).
         var sparkleTop = body.minY - 8
@@ -1338,7 +1355,7 @@ struct SceneCanvas: View {
             for k in 0..<3 {
                 let p = (t * 0.35 + Double(k) / 3).truncatingRemainder(dividingBy: 1)
                 let txt = Text("z").font(.system(size: 9 + p * 9, weight: .heavy, design: .rounded)).foregroundColor(.white.opacity(1 - p))
-                ctx.draw(txt, at: CGPoint(x: body.maxX + 6 + p * 18 + sin(p * 6) * 3, y: body.minY - p * 34))
+                cg.draw(txt, at: CGPoint(x: body.maxX + 6 + p * 18 + sin(p * 6) * 3, y: body.minY - p * 34))
             }
         }
 
@@ -1348,9 +1365,9 @@ struct SceneCanvas: View {
             let pos = CGPoint(x: cx + p.x, y: sparkleTop + p.y)
             let col = Color(hue: p.hue, saturation: 0.45, brightness: 1).opacity(o)
             if let g = p.glyph {
-                ctx.draw(Text(g).font(.system(size: 6 + p.size * 1.5, weight: .bold, design: .rounded)).foregroundColor(col), at: pos)
+                cg.draw(Text(g).font(.system(size: 6 + p.size * 1.5, weight: .bold, design: .rounded)).foregroundColor(col), at: pos)
             } else {
-                ctx.fill(heart(pos, p.size * 0.8), with: .color(col))
+                cg.fill(heart(pos, p.size * 0.8), with: .color(col))
             }
         }
 
@@ -1360,6 +1377,382 @@ struct SceneCanvas: View {
             let r = CGRect(x: w - sz.width - 22, y: 32, width: sz.width + 14, height: sz.height + 6)
             ctx.fill(Path(roundedRect: r, cornerRadius: r.height / 2), with: .color(.white.opacity(0.18)))
             ctx.draw(txt, at: CGPoint(x: r.midX, y: r.midY))
+        }
+    }
+}
+
+/// Content width shared by the temperature and first-token badges, so they line up as a matching pair.
+let badgeInnerWidth = 83.0
+
+/// A little thermometer friend for the scene's top-left corner: the GPU temperature, with a face that
+/// shivers when it's cold, sweats when it's toasty and steams when it's hot. Click to switch °C / °F.
+struct ThermoBuddy: View {
+    let celsius: Double
+    let time: Double
+    @AppStorage("tempFahrenheit") private var fahrenheit = false
+
+    init(celsius: Double, time: Double) {
+        self.celsius = celsius
+        self.time = time
+    }
+
+    private enum Feel { case chilly, comfy, warm, toasty, spicy }
+    private var feel: Feel {
+        switch celsius {
+        case ..<40: return .chilly
+        case ..<55: return .comfy
+        case ..<70: return .warm
+        case ..<85: return .toasty
+        default: return .spicy
+        }
+    }
+    private var label: String {
+        switch feel {
+        case .chilly: return "chilly ❄︎"
+        case .comfy: return "comfy"
+        case .warm: return "warm"
+        case .toasty: return "toasty"
+        case .spicy: return "spicy!"
+        }
+    }
+    private var color: Color {
+        switch feel {
+        case .chilly: return Color(red: 0.5, green: 0.78, blue: 1)
+        case .comfy: return Color(red: 0.45, green: 0.92, blue: 0.62)
+        case .warm: return Color(red: 1, green: 0.82, blue: 0.38)
+        case .toasty: return Color(red: 1, green: 0.58, blue: 0.3)
+        case .spicy: return Color(red: 1, green: 0.32, blue: 0.38)
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Canvas { ctx, size in draw(&ctx, size) }
+                .frame(width: 26, height: 42)
+            VStack(alignment: .leading, spacing: -1) {
+                Text(fahrenheit ? "\(Int((celsius * 9 / 5 + 32).rounded()))°F" : "\(Int(celsius.rounded()))°C")
+                    .font(.system(size: 15, weight: .heavy, design: .rounded)).monospacedDigit()
+                    .foregroundColor(.white)
+                Text(label)
+                    .font(.system(size: 8.5, weight: .black, design: .rounded))
+                    .foregroundColor(color)
+            }
+            .fixedSize()
+        }
+        .frame(width: badgeInnerWidth, alignment: .leading)
+        .padding(.leading, 4).padding(.trailing, 10).padding(.vertical, 3)
+        .background(Capsule().fill(Color(red: 0.08, green: 0.07, blue: 0.12).opacity(0.82)))
+        .overlay(Capsule().stroke(color.opacity(0.35 + (feel == .spicy ? 0.3 * sin(time * 8) : 0)), lineWidth: 1))
+        .contentShape(Capsule())
+        .onTapGesture { fahrenheit.toggle() }
+        .help("GPU temperature (average of the chip's GPU sensors), \(label). Click to switch °C / °F.")
+    }
+
+    private func draw(_ ctx: inout GraphicsContext, _ size: CGSize) {
+        let t = time
+        // Shiver when chilly, a slow happy sway otherwise.
+        let dx = feel == .chilly ? sin(t * 45) * 0.7 : sin(t * 1.6) * 0.5
+        ctx.translateBy(x: dx, y: 0)
+        let cx = 11.0
+        let tube = CGRect(x: cx - 4, y: 6, width: 8, height: 24)
+        let bulbC = CGPoint(x: cx, y: 33), bulbR = 7.5
+        let glass = Color.white.opacity(0.9)
+
+        // Glass: tube and bulb.
+        ctx.fill(Path(roundedRect: tube, cornerRadius: 4), with: .color(glass))
+        ctx.fill(Path(ellipseIn: CGRect(x: bulbC.x - bulbR, y: bulbC.y - bulbR, width: bulbR * 2, height: bulbR * 2)), with: .color(glass))
+
+        // Mercury: rises from 30 °C (empty) to 95 °C (full), with a little wobble on top.
+        let frac = min(1, max(0.08, (celsius - 30) / 65)) + 0.03 * sin(t * 3)
+        let inner = tube.insetBy(dx: 2, dy: 2)
+        let topY = inner.maxY - inner.height * frac
+        ctx.fill(Path(roundedRect: CGRect(x: inner.minX, y: topY, width: inner.width, height: inner.maxY - topY + 4),
+                      cornerRadius: 2), with: .color(color))
+        let br = bulbR - 2
+        ctx.fill(Path(ellipseIn: CGRect(x: bulbC.x - br, y: bulbC.y - br, width: br * 2, height: br * 2)), with: .color(color))
+        // Tick marks on the tube.
+        for i in 1...3 {
+            let y = tube.minY + Double(i) * tube.height / 4
+            var tick = Path(); tick.move(to: CGPoint(x: tube.maxX - 2.5, y: y)); tick.addLine(to: CGPoint(x: tube.maxX, y: y))
+            ctx.stroke(tick, with: .color(.black.opacity(0.25)), lineWidth: 0.7)
+        }
+
+        // Face on the bulb: eyes blink now and then, cheeks blush, mouth shows the mood.
+        let ink = Color(red: 0.2, green: 0.12, blue: 0.25)
+        let blink = (t.truncatingRemainder(dividingBy: 3.7)) < 0.12
+        for ex in [-2.6, 2.6] {
+            let e = CGPoint(x: bulbC.x + ex, y: bulbC.y - 1.5)
+            if blink || feel == .spicy {
+                // closed / squeezed eyes: little arcs
+                var p = Path(); p.move(to: CGPoint(x: e.x - 1.3, y: e.y)); p.addLine(to: CGPoint(x: e.x + 1.3, y: e.y))
+                ctx.stroke(p, with: .color(ink), lineWidth: 1)
+            } else {
+                ctx.fill(Path(ellipseIn: CGRect(x: e.x - 1, y: e.y - 1.2, width: 2, height: 2.4)), with: .color(ink))
+            }
+            ctx.fill(Path(ellipseIn: CGRect(x: e.x - 1.6 + (ex > 0 ? 0.9 : -0.9), y: e.y + 1.8, width: 2.4, height: 1.4)),
+                     with: .color(Color(red: 1, green: 0.45, blue: 0.6).opacity(0.75)))
+        }
+        var mouth = Path()
+        let m = CGPoint(x: bulbC.x, y: bulbC.y + 2.6)
+        switch feel {
+        case .chilly:  // wobbly, chattering teeth
+            mouth.move(to: CGPoint(x: m.x - 2.2, y: m.y))
+            for i in 1...4 { mouth.addLine(to: CGPoint(x: m.x - 2.2 + Double(i) * 1.1, y: m.y + (i % 2 == 0 ? 0 : 0.8))) }
+            ctx.stroke(mouth, with: .color(ink), lineWidth: 0.8)
+        case .comfy, .warm:  // smile
+            mouth.addArc(center: CGPoint(x: m.x, y: m.y - 1), radius: 1.8, startAngle: .degrees(20), endAngle: .degrees(160), clockwise: false)
+            ctx.stroke(mouth, with: .color(ink), lineWidth: 0.9)
+        case .toasty:  // little panting "o"
+            let r = 0.9 + 0.3 * sin(t * 9)
+            ctx.fill(Path(ellipseIn: CGRect(x: m.x - r, y: m.y - r, width: r * 2, height: r * 2.2)), with: .color(ink))
+        case .spicy:  // wide open, tongue out
+            ctx.fill(Path(ellipseIn: CGRect(x: m.x - 1.8, y: m.y - 1.2, width: 3.6, height: 3)), with: .color(ink))
+            ctx.fill(Path(ellipseIn: CGRect(x: m.x - 1, y: m.y + 0.4, width: 2, height: 1.4)), with: .color(Color(red: 1, green: 0.5, blue: 0.6)))
+        }
+
+        // Weather around it.
+        switch feel {
+        case .chilly:  // a snowflake drifting down
+            let y = (t * 6).truncatingRemainder(dividingBy: 30)
+            ctx.draw(Text("❄︎").font(.system(size: 6)).foregroundColor(.white.opacity(0.8)), at: CGPoint(x: 21, y: 4 + y))
+        case .toasty, .spicy:  // sweat drops sliding down the tube
+            for k in 0..<(feel == .spicy ? 2 : 1) {
+                let ph = (t * 0.9 + Double(k) * 0.5).truncatingRemainder(dividingBy: 1)
+                let d = CGPoint(x: tube.maxX + 2.5 + Double(k) * 2.5, y: 9 + ph * 16)
+                var drop = Path()
+                drop.move(to: CGPoint(x: d.x, y: d.y - 2.2))
+                drop.addQuadCurve(to: CGPoint(x: d.x, y: d.y + 1.4), control: CGPoint(x: d.x + 2.2, y: d.y + 0.8))
+                drop.addQuadCurve(to: CGPoint(x: d.x, y: d.y - 2.2), control: CGPoint(x: d.x - 2.2, y: d.y + 0.8))
+                ctx.fill(drop, with: .color(Color(red: 0.55, green: 0.85, blue: 1).opacity(1 - ph * 0.7)))
+            }
+            if feel == .spicy {  // steam curling off the top
+                for k in 0..<2 {
+                    let ph = (t * 0.7 + Double(k) * 0.5).truncatingRemainder(dividingBy: 1)
+                    var s = Path()
+                    let x0 = cx - 2 + Double(k) * 4, y0 = tube.minY - 1 - ph * 6
+                    s.move(to: CGPoint(x: x0, y: y0))
+                    s.addCurve(to: CGPoint(x: x0, y: y0 - 5), control1: CGPoint(x: x0 + 2.5, y: y0 - 1.5), control2: CGPoint(x: x0 - 2.5, y: y0 - 3.5))
+                    ctx.stroke(s, with: .color(.white.opacity(0.6 * (1 - ph))), lineWidth: 1)
+                }
+            }
+        default:
+            break
+        }
+    }
+}
+
+/// A little stopwatch friend under the thermometer: how long the model took to start answering (time to first
+/// token). Its face and hand speed follow the time: zippy and spinning when it's fast, sleepy when it's slow.
+/// The numbers follow the latest request's model and prompt-cache setting (gpud starts the average over when they change).
+struct StopwatchBuddy: View {
+    let tokens: Snapshot.Tokens
+    let time: Double
+
+    init(tokens: Snapshot.Tokens, time: Double) {
+        self.tokens = tokens
+        self.time = time
+    }
+
+    private var seconds: Double { tokens.ttft_s ?? tokens.ttft_avg_s ?? 0 }
+    private enum Feel { case zippy, quick, thinking, slow }
+    private var feel: Feel {
+        switch seconds {
+        case ..<1: return .zippy
+        case ..<5: return .quick
+        case ..<20: return .thinking
+        default: return .slow
+        }
+    }
+    private var label: String {
+        switch feel {
+        case .zippy: return "zippy!"
+        case .quick: return "quick"
+        case .thinking: return "thinking…"
+        case .slow: return "sloooow"
+        }
+    }
+    private var color: Color {
+        switch feel {
+        case .zippy: return Color(red: 0.45, green: 0.95, blue: 0.6)
+        case .quick: return Color(red: 0.55, green: 0.9, blue: 0.85)
+        case .thinking: return Color(red: 1, green: 0.7, blue: 0.35)
+        case .slow: return Color(red: 1, green: 0.45, blue: 0.55)
+        }
+    }
+    private var helpText: String {
+        var lines = ["Time to first token: how long \(tokens.ttft_model ?? "the model") took to start answering, "
+                     + "\(ttftText(seconds)) for the latest request."]
+        if let p = tokens.ttft_prompt_tokens, p > 0 {
+            let n = NumberFormatter.localizedString(from: NSNumber(value: Int(p)), number: .decimal)
+            var line = "📖 It read \(n) prompt tokens before the first token"
+            if seconds > 0 {
+                line += " (about \(NumberFormatter.localizedString(from: NSNumber(value: Int(p / seconds)), number: .decimal)) tokens/s)"
+            }
+            lines.append(line + ". Longer prompts mean a longer wait.")
+        }
+        if let c = tokens.ttft_cache {
+            lines.append("⚡ Prompt cache: \(c ? "on, so repeated text is read faster" : "off").")
+        }
+        if let avg = average {
+            lines.append("Average \(ttftText(avg)) over \(Int(tokens.ttft_samples ?? 0)) recent requests with the same model "
+                         + "and cache setting. It starts over when either changes.")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// The average, shown only when it covers more than the latest request.
+    private var average: Double? {
+        guard tokens.ttft_s != nil, (tokens.ttft_samples ?? 0) > 1 else { return nil }
+        return tokens.ttft_avg_s
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Canvas { ctx, size in draw(&ctx, size) }
+                .frame(width: 26, height: 34)
+            VStack(alignment: .leading, spacing: -1) {
+                HStack(spacing: 3) {
+                    Text("1ST TOKEN")
+                        .font(.system(size: 6.5, weight: .black, design: .rounded))
+                        .foregroundColor(.white.opacity(0.55))
+                    if let c = tokens.ttft_cache {  // tiny bolt: prompt cache on (filled) or off (crossed out)
+                        Image(systemName: c ? "bolt.fill" : "bolt.slash.fill")
+                            .font(.system(size: 5.5, weight: .heavy))
+                            .foregroundColor(c ? .black.opacity(0.75) : .white.opacity(0.6))
+                            .frame(width: 10, height: 10)
+                            .background(Circle().fill(c ? color : .white.opacity(0.14)))
+                    }
+                }
+                Text(ttftText(seconds))
+                    .font(.system(size: 15, weight: .heavy, design: .rounded)).monospacedDigit()
+                    .foregroundColor(.white)
+                    .contentTransition(.numericText())
+                    .animation(.snappy, value: seconds)
+                Text(label)
+                    .font(.system(size: 8.5, weight: .black, design: .rounded))
+                    .foregroundColor(color)
+                // How much it read before answering: the prompt is what the first-token wait is spent on.
+                if let p = tokens.ttft_prompt_tokens, p > 0 {
+                    HStack(spacing: 2.5) {
+                        Image(systemName: "book.fill")
+                            .font(.system(size: 6.5, weight: .bold))
+                            .foregroundColor(color)
+                        Text("\(shortCount(p)) read")
+                            .font(.system(size: 8, weight: .heavy, design: .rounded)).monospacedDigit()
+                            .foregroundColor(.white.opacity(0.85))
+                            .contentTransition(.numericText())
+                            .animation(.snappy, value: p)
+                    }
+                    .padding(.top, 1.5)
+                }
+                if let avg = average {
+                    Text("avg \(ttftText(avg))")
+                        .font(.system(size: 7.5, weight: .bold, design: .rounded)).monospacedDigit()
+                        .foregroundColor(.white.opacity(0.5))
+                }
+            }
+            .fixedSize()
+        }
+        .frame(width: badgeInnerWidth, alignment: .leading)
+        .padding(.leading, 4).padding(.trailing, 10).padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 16).fill(Color(red: 0.08, green: 0.07, blue: 0.12).opacity(0.82)))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(color.opacity(0.4), lineWidth: 1))
+        .help(helpText)
+    }
+
+    private func draw(_ ctx: inout GraphicsContext, _ size: CGSize) {
+        let t = time
+        let c = CGPoint(x: 13, y: 19), r = 10.0
+        let ink = Color(red: 0.2, green: 0.12, blue: 0.25)
+        // A happy hop when it's zippy, a slow droop when it's slow.
+        let dy = feel == .zippy ? -abs(sin(t * 7)) * 1.6 : (feel == .slow ? sin(t * 1.2) * 0.6 : 0)
+        ctx.translateBy(x: 0, y: dy)
+
+        // Speed lines behind it when zippy.
+        if feel == .zippy {
+            for k in 0..<3 {
+                let ph = (t * 3 + Double(k) * 0.33).truncatingRemainder(dividingBy: 1)
+                var l = Path()
+                let y = c.y - 4 + Double(k) * 4
+                l.move(to: CGPoint(x: 2 - ph * 2, y: y)); l.addLine(to: CGPoint(x: 5 - ph * 2, y: y))
+                ctx.stroke(l, with: .color(color.opacity(1 - ph)), lineWidth: 1)
+            }
+        }
+        // Crown and side button.
+        ctx.fill(Path(roundedRect: CGRect(x: c.x - 2.5, y: c.y - r - 4.5, width: 5, height: 3), cornerRadius: 1),
+                 with: .color(.white.opacity(0.9)))
+        ctx.fill(Path(CGRect(x: c.x - 1, y: c.y - r - 2, width: 2, height: 2.5)), with: .color(.white.opacity(0.9)))
+        var side = Path()
+        side.move(to: CGPoint(x: c.x + r * 0.62, y: c.y - r * 0.85)); side.addLine(to: CGPoint(x: c.x + r * 0.9, y: c.y - r * 1.1))
+        ctx.stroke(side, with: .color(.white.opacity(0.9)), style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
+
+        // Face, with a colored ring that fills up to 30 s.
+        ctx.fill(Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)), with: .color(.white.opacity(0.92)))
+        var ring = Path()
+        ring.addArc(center: c, radius: r - 1.2, startAngle: .degrees(-90),
+                    endAngle: .degrees(-90 + 360 * min(1, max(0.06, seconds / 30))), clockwise: false)
+        ctx.stroke(ring, with: .color(color), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+
+        // The hand: spins fast when zippy, creeps when slow.
+        let speed: Double = [Feel.zippy: 9, .quick: 4, .thinking: 1.5, .slow: 0.4][feel] ?? 1
+        let ang = t * speed
+        var hand = Path()
+        hand.move(to: c); hand.addLine(to: CGPoint(x: c.x + sin(ang) * (r - 4), y: c.y - cos(ang) * (r - 4)))
+        ctx.stroke(hand, with: .color(color.opacity(0.55)), style: StrokeStyle(lineWidth: 1, lineCap: .round))
+
+        // Eyes, cheeks and mouth.
+        let blink = (t.truncatingRemainder(dividingBy: 4.3)) < 0.12
+        for ex in [-3.0, 3.0] {
+            let e = CGPoint(x: c.x + ex, y: c.y - 1)
+            switch feel {
+            case .zippy:  // happy ^ ^ eyes
+                var p = Path()
+                p.move(to: CGPoint(x: e.x - 1.3, y: e.y + 0.6)); p.addLine(to: CGPoint(x: e.x, y: e.y - 0.7))
+                p.addLine(to: CGPoint(x: e.x + 1.3, y: e.y + 0.6))
+                ctx.stroke(p, with: .color(ink), style: StrokeStyle(lineWidth: 0.9, lineCap: .round, lineJoin: .round))
+            case .slow:  // sleepy, half-closed
+                var p = Path()
+                p.addArc(center: CGPoint(x: e.x, y: e.y - 0.3), radius: 1.3, startAngle: .degrees(20), endAngle: .degrees(160), clockwise: false)
+                ctx.stroke(p, with: .color(ink), lineWidth: 0.9)
+            case .thinking:  // looking up and to the side
+                ctx.fill(Path(ellipseIn: CGRect(x: e.x - 0.6, y: e.y - 2, width: 1.9, height: 2.2)), with: .color(ink))
+            case .quick:
+                if blink {
+                    var p = Path(); p.move(to: CGPoint(x: e.x - 1.2, y: e.y)); p.addLine(to: CGPoint(x: e.x + 1.2, y: e.y))
+                    ctx.stroke(p, with: .color(ink), lineWidth: 0.9)
+                } else {
+                    ctx.fill(Path(ellipseIn: CGRect(x: e.x - 1, y: e.y - 1.2, width: 2, height: 2.4)), with: .color(ink))
+                }
+            }
+            ctx.fill(Path(ellipseIn: CGRect(x: e.x - 1.2 + (ex > 0 ? 0.8 : -0.8), y: e.y + 2, width: 2.4, height: 1.3)),
+                     with: .color(Color(red: 1, green: 0.45, blue: 0.6).opacity(0.7)))
+        }
+        let m = CGPoint(x: c.x, y: c.y + 3.6)
+        var mouth = Path()
+        switch feel {
+        case .zippy, .quick:  // smile (big one when zippy)
+            let mr = feel == .zippy ? 2.2 : 1.6
+            mouth.addArc(center: CGPoint(x: m.x, y: m.y - mr * 0.6), radius: mr, startAngle: .degrees(20), endAngle: .degrees(160), clockwise: false)
+            ctx.stroke(mouth, with: .color(ink), lineWidth: 0.9)
+        case .thinking:  // a little sideways "hmm"
+            mouth.move(to: CGPoint(x: m.x - 1.4, y: m.y + 0.3)); mouth.addLine(to: CGPoint(x: m.x + 1.4, y: m.y - 0.3))
+            ctx.stroke(mouth, with: .color(ink), style: StrokeStyle(lineWidth: 0.9, lineCap: .round))
+        case .slow:  // yawning "o"
+            let yr = 0.8 + 0.4 * max(0, sin(t * 1.5))
+            ctx.fill(Path(ellipseIn: CGRect(x: m.x - yr, y: m.y - yr, width: yr * 2, height: yr * 2.2)), with: .color(ink))
+        }
+
+        // Thought dots when thinking, a floating "z" when slow.
+        if feel == .thinking {
+            for k in 0..<3 {
+                let on = Int(t * 2.5) % 4 > k
+                ctx.fill(Path(ellipseIn: CGRect(x: c.x + r - 1 + Double(k) * 2.6, y: c.y - r - 3 - Double(k) * 1.2, width: 1.8, height: 1.8)),
+                         with: .color(.white.opacity(on ? 0.85 : 0.2)))
+            }
+        } else if feel == .slow {
+            let ph = (t * 0.5).truncatingRemainder(dividingBy: 1)
+            ctx.draw(Text("z").font(.system(size: 6 + ph * 2, weight: .heavy, design: .rounded)).foregroundColor(.white.opacity(1 - ph)),
+                     at: CGPoint(x: c.x + r + 1 + ph * 3, y: c.y - r - ph * 6))
         }
     }
 }
@@ -1457,7 +1850,7 @@ struct TokenCard: View {
     var body: some View {
         VStack(spacing: 4) {
             // Model name banner — prominently shows which LLM is active.
-            if let src = tokens?.sources, !src.isEmpty, let model = activeModel(src), !model.isEmpty {
+            if let model = bannerModel, !model.isEmpty {
                 HStack(spacing: 4) {
                     Image(systemName: "cpu").font(.system(size: 7.5, weight: .medium))
                     Text(model).font(.system(size: 8, weight: .semibold, design: .rounded))
@@ -1465,11 +1858,11 @@ struct TokenCard: View {
                 }
                 .foregroundColor(.white.opacity(0.7))
                 .lineLimit(1)
-                .fixedSize()
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
                 .background(RoundedRectangle(cornerRadius: 5).fill(gold.opacity(0.15)))
             }
+
             HStack(spacing: 8) {
                 stat("✍️ GENERATED · 24h", tokens?.generated_24h, live: tokens.flatMap { $0.speed_tok_s > 0 ? "⚡\(Int($0.speed_tok_s)) tok/s" : nil })
                 stat("📖 USED · 24h", tokens?.prompt_24h, live: tokens.flatMap { $0.prompt_per_s > 0 ? "+\(shortCount($0.prompt_per_s))/s" : nil })
@@ -1483,6 +1876,12 @@ struct TokenCard: View {
     private func activeModel(_ src: [Snapshot.Tokens.Source]) -> String? {
         guard let active = src.first(where: { $0.tok_s > 0 }) else { return nil }
         return active.model.isEmpty ? active.name : active.model
+    }
+
+    /// The model writing right now, or else the one that answered last (so the first-token time stays visible).
+    private var bannerModel: String? {
+        if let src = tokens?.sources, let m = activeModel(src) { return m }
+        return tokens?.ttft_model
     }
 
     private func stat(_ title: String, _ value: Double?, live: String?) -> some View {
@@ -1517,6 +1916,9 @@ struct TokenCard: View {
             if let g = s.generated_total, let p = s.prompt_total {
                 line += "\n   \(shortCount(g)) generated · \(shortCount(p)) used since server start"
             }
+            if let t = s.ttft_s ?? s.ttft_avg_s {
+                line += "\n   first token in \(ttftText(t))" + (s.ttft_s != nil ? s.ttft_avg_s.map { " (avg \(ttftText($0)))" } ?? "" : " on average")
+            }
             return line
         }.joined(separator: "\n")
     }
@@ -1535,9 +1937,6 @@ struct PowerCard: View {
                      power?.gpu_peak_w.map { "peak " + String(format: $0 < 10 ? "%.1f W" : "%.0f W", $0) })
                 stat("🔌 CHIP", power?.soc_w.map { String(format: "%.0f W", $0) },
                      power?.system_w.map { "whole Mac \(Int($0)) W" } ?? power?.cpu_w.map { "CPU \(Int($0)) W" })
-                if let t = power?.gpu_temp {
-                    stat("🌡️ GPU TEMP", "\(String(format: "%.0f °C", t))", nil)
-                }
                 stat("🍃 PER TOKEN", perToken, perTokenSub)
             }
         }
@@ -1930,6 +2329,15 @@ func shortCount(_ v: Double) -> String {
     return String(format: "%.0f", v)
 }
 
+/// A time-to-first-token in seconds, short: "0.18 s", "2.4 s", "52 s", "1m 05s".
+func ttftText(_ s: Double) -> String {
+    if s < 1 { return String(format: "%.2f s", s) }
+    if s < 10 { return String(format: "%.1f s", s) }
+    if s < 60 { return "\(Int(s.rounded())) s" }
+    let t = Int(s.rounded())
+    return String(format: "%dm %02ds", t / 60, t % 60)
+}
+
 func bigNumber(_ v: Double) -> String {
     let units: [(Double, String)] = [(1e21, "sextillion"), (1e18, "quintillion"), (1e15, "quadrillion"), (1e12, "trillion"), (1e9, "billion"), (1e6, "million")]
     for (scale, name) in units where v >= scale {
@@ -2075,7 +2483,7 @@ struct ContentView: View {
     // Full window: Chippy, stats, processes, hype and the 24h timeline.
     private func full(_ s: Snapshot?) -> some View {
         VStack(spacing: 8) {
-            SceneCanvas(anim: anim, mood: store.mood, badge: badge, character: characters.current)
+            SceneCanvas(anim: anim, mood: store.mood, badge: badge, character: characters.current, roomForBadges: true)
                 .frame(height: sceneHeight)
                 .clipped()
                 .overlay(WindowDragArea())
@@ -2087,6 +2495,26 @@ struct ContentView: View {
                         #endif
                     }
                     .padding(8)
+                }
+                .overlay(alignment: .topLeading) {
+                    // GPU temperature and time to first token, as little friends (below the window buttons on the Mac).
+                    if store.online, store.scrubTime == nil {
+                        VStack(alignment: .leading, spacing: 4) {
+                            if let c = s?.power?.gpu_temp {
+                                ThermoBuddy(celsius: c, time: anim.time)
+                            }
+                            if let tk = s?.tokens, tk.ttft_s ?? tk.ttft_avg_s != nil {
+                                StopwatchBuddy(tokens: tk, time: anim.time)
+                            }
+                        }
+                        .scaleEffect(0.8, anchor: .topLeading)  // small, so they stay clear of the character
+                        #if os(macOS)
+                        .padding(.top, 30)
+                        #else
+                        .padding(.top, 8)
+                        #endif
+                        .padding(.leading, 8)
+                    }
                 }
 
             VStack(spacing: 8) {
@@ -2193,7 +2621,8 @@ struct ContentView: View {
                     .foregroundColor(.white.opacity(0.6))
                     .lineLimit(1).minimumScaleFactor(0.75)
                 if let tk = store.online ? s?.tokens : nil {
-                    Text("✍️\(shortCount(tk.generated_24h)) 📖\(shortCount(tk.prompt_24h))\(tk.speed_tok_s > 0 ? " ⚡\(Int(tk.speed_tok_s))/s" : " tokens")")
+                    Text("✍️\(shortCount(tk.generated_24h)) 📖\(shortCount(tk.prompt_24h))\(tk.speed_tok_s > 0 ? " ⚡\(Int(tk.speed_tok_s))/s" : " tokens")"
+                         + ((tk.ttft_s ?? tk.ttft_avg_s).map { " ⏱\(ttftText($0))" } ?? ""))
                         .font(.system(size: 9, weight: .semibold, design: .rounded)).monospacedDigit()
                         .foregroundColor(Color(red: 1, green: 0.85, blue: 0.5))
                         .lineLimit(1)
@@ -2270,7 +2699,7 @@ struct AppIcon: View {
 #if os(macOS)
 struct AboutView: View {
     let daemonVersion: String?
-    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.11.0"
+    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.12.0"
 
     var body: some View {
         VStack(spacing: 16) {

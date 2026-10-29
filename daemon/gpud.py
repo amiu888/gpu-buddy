@@ -60,7 +60,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 RETENTION_SECONDS = 24 * 3600
 STATE_DIR = os.path.expanduser("~/Library/Application Support/GPUBuddy")
 DEFAULT_DB = os.path.join(STATE_DIR, "history.db")
@@ -184,6 +184,25 @@ LLM_HINTS = ("mlx", "llama", "ollama", "vllm", "lm studio", "lmstudio", "lms ", 
 PROM_PROMPT = ("llamacpp:prompt_tokens_total", "vllm:prompt_tokens_total", "sglang:prompt_tokens_total")
 PROM_GEN = ("llamacpp:tokens_predicted_total", "vllm:generation_tokens_total", "sglang:generation_tokens_total")
 PROM_RUNNING = ("llamacpp:requests_processing", "vllm:num_requests_running", "sglang:num_running_reqs")
+PROM_TTFT_SUM = ("vllm:time_to_first_token_seconds_sum", "sglang:time_to_first_token_seconds_sum")
+PROM_TTFT_COUNT = ("vllm:time_to_first_token_seconds_count", "sglang:time_to_first_token_seconds_count")
+
+
+def latest_ttft(sources):
+    """Time to first token for the status payload: the most recent request across all servers that report it."""
+    keys = ("ttft_s", "ttft_avg_s", "ttft_model", "ttft_prompt_tokens", "ttft_cache", "ttft_samples")
+    have = [s for s in sources if s.get("ttft_avg_s") is not None]
+    if not have:
+        return dict.fromkeys(keys)
+    s = max(have, key=lambda x: x.get("ttft_at") or 0)
+    return {k: s.get(k) for k in keys} | {"ttft_model": s.get("ttft_model") or s["model"] or s["name"]}
+
+
+def model_name(path):
+    """A readable model name from a path or repo id: ".../qwen36-moe-mlx/model" -> "qwen36-moe-mlx"."""
+    p = str(path or "").rstrip("/")
+    name = os.path.basename(p)
+    return os.path.basename(os.path.dirname(p)) if name == "model" else name
 
 
 def http_get(url, timeout=0.5):
@@ -261,15 +280,15 @@ class TokenWatcher:
         return None
 
     def _read(self, src):
-        """(prompt_total, generated_total, in_flight, speed tok/s, model) or None."""
+        """(prompt_total, generated_total, in_flight, speed tok/s, model, ttft) or None.
+        ttft is {"last", "avg", "at", "model", "prompt", "cache", "n"} for the latest request, or None (see _mlx_ttft)."""
         if src["kind"] == "mlx-json":
             d = json.loads(http_get(src["url"] + "/metrics"))
             sm, latest, srv = d.get("summary", {}), d.get("latest") or {}, d.get("server") or {}
-            model = os.path.basename(str(srv.get("loaded_model") or latest.get("model") or "").rstrip("/"))
-            if model == "model":  # ".../qwen36-moe-mlx/model" -> "qwen36-moe-mlx"
-                model = os.path.basename(os.path.dirname(str(srv.get("loaded_model") or latest.get("model")).rstrip("/")))
+            model = model_name(srv.get("loaded_model") or latest.get("model"))
+            ttft = self._mlx_ttft(d, latest, srv)
             return (sm.get("prompt_tokens_total", 0), sm.get("completion_tokens_total", 0),
-                    sm.get("in_flight", 0), latest.get("decode_tok_s", 0) or 0, model)
+                    sm.get("in_flight", 0), latest.get("decode_tok_s", 0) or 0, model, ttft)
         if src["kind"] == "prometheus":
             vals = {}
             for line in http_get(src["url"] + "/metrics").decode(errors="replace").splitlines():
@@ -282,10 +301,32 @@ class TokenWatcher:
                 except ValueError:
                     pass
             pick = lambda keys: sum(vals.get(k, 0) for k in keys)
-            return pick(PROM_PROMPT), pick(PROM_GEN), pick(PROM_RUNNING), None, ""
+            # vLLM / SGLang publish a time-to-first-token histogram; its sum / count is the average.
+            n = pick(PROM_TTFT_COUNT)
+            ttft = {"last": None, "avg": pick(PROM_TTFT_SUM) / n, "at": 0, "model": "", "prompt": None,
+                    "cache": None, "n": int(n)} if n else None
+            return pick(PROM_PROMPT), pick(PROM_GEN), pick(PROM_RUNNING), None, "", ttft
         if src["kind"] == "ollama":
             return None  # Ollama exposes no token counters
         return None
+
+    @staticmethod
+    def _mlx_ttft(d, latest, srv):
+        """Time to first token from an MLX server's /metrics, kept true to the current setup: the average only counts
+        recent requests with the same model and the same prompt-cache setting as the latest one, so it starts over
+        when either changes, and nothing is shown if the server has since loaded a different model."""
+        if not latest.get("ttft_s"):
+            return None
+        loaded = srv.get("loaded_model")
+        if loaded and latest.get("model") and model_name(loaded) != model_name(latest["model"]):
+            return None  # the latest request was for a model that's no longer loaded
+        cache = latest.get("apc_enabled")
+        same = [r["ttft_s"] for r in (d.get("recent") or [])
+                if isinstance(r, dict) and r.get("ttft_s") and r.get("model") == latest.get("model")
+                and r.get("apc_enabled") == cache]
+        return {"last": latest["ttft_s"], "avg": sum(same) / len(same) if same else latest["ttft_s"],
+                "at": latest.get("timestamp_unix") or 0, "model": model_name(latest.get("model")),
+                "prompt": latest.get("prompt_tokens"), "cache": cache, "n": max(1, len(same))}
 
     def poll(self):
         now = time.time()
@@ -306,7 +347,7 @@ class TokenWatcher:
                     with self.lock:
                         self.sources[base] = {"url": base, "kind": kind, "pid": pid, "name": name, "model": "",
                                               "prompt": None, "gen": None, "in_flight": 0, "speed": 0.0,
-                                              "gen_rate": 0.0, "prompt_rate": 0.0, "last_ts": now}
+                                              "gen_rate": 0.0, "prompt_rate": 0.0, "last_ts": now, "ttft": None}
         with self.lock:
             sources = list(self.sources.values())
         for src in sources:
@@ -318,7 +359,7 @@ class TokenWatcher:
                 if not r:
                     src["gen_rate"] = src["prompt_rate"] = 0.0
                     continue
-                prompt, gen, in_flight, speed, model = r
+                prompt, gen, in_flight, speed, model, ttft = r
                 dt = max(now - src["last_ts"], 1e-3)
                 # Counters reset when a server restarts; count what it has done since then.
                 d_prompt = 0 if src["prompt"] is None else (prompt - src["prompt"] if prompt >= src["prompt"] else prompt)
@@ -330,7 +371,7 @@ class TokenWatcher:
                     by = self._pending_by.setdefault((src["name"], model), [0, 0])
                     by[0] += d_gen
                     by[1] += d_prompt
-                src.update(prompt=prompt, gen=gen, in_flight=in_flight, model=model,
+                src.update(prompt=prompt, gen=gen, in_flight=in_flight, model=model, ttft=ttft,
                            gen_rate=d_gen / dt, prompt_rate=d_prompt / dt, last_ts=now,
                            speed=(speed if speed is not None else d_gen / dt) if (in_flight or d_gen) else 0.0)
 
@@ -342,7 +383,14 @@ class TokenWatcher:
             self._pending_by = {}
             view = [{"name": s["name"], "url": s["url"], "kind": s["kind"], "pid": s["pid"], "model": s["model"],
                      "in_flight": s["in_flight"], "tok_s": round(s["speed"], 1),
-                     "generated_total": s["gen"], "prompt_total": s["prompt"]}
+                     "generated_total": s["gen"], "prompt_total": s["prompt"],
+                     "ttft_s": round(s["ttft"]["last"], 3) if s["ttft"] and s["ttft"]["last"] is not None else None,
+                     "ttft_avg_s": round(s["ttft"]["avg"], 3) if s["ttft"] else None,
+                     "ttft_at": s["ttft"]["at"] if s["ttft"] else None,
+                     "ttft_model": (s["ttft"]["model"] or s["model"]) if s["ttft"] else None,
+                     "ttft_prompt_tokens": s["ttft"]["prompt"] if s["ttft"] else None,
+                     "ttft_cache": s["ttft"]["cache"] if s["ttft"] else None,
+                     "ttft_samples": s["ttft"]["n"] if s["ttft"] else None}
                     for s in self.sources.values()]
         return int(gen), int(prompt), view, by
 
@@ -923,7 +971,8 @@ class HistoryDB:
                 "tokens": {"generated_per_s": round(gen_min / 60, 1), "prompt_per_s": round(prompt_min / 60, 1),
                            "generated_delta": tok_gen or 0, "prompt_delta": tok_prompt or 0,
                            "generated_24h": day_gen, "prompt_24h": day_prompt,
-                           "speed_tok_s": 0, "in_flight": 0, "sources": []}}
+                           "speed_tok_s": 0, "in_flight": 0, "ttft_s": None, "ttft_avg_s": None, "ttft_model": None,
+                           "ttft_prompt_tokens": None, "ttft_cache": None, "ttft_samples": None, "sources": []}}
 
 
 class GPUSampler:
@@ -1165,6 +1214,7 @@ class GPUSampler:
                 "prompt_24h": self._tok24[1],
                 "speed_tok_s": max((s["tok_s"] for s in sources), default=0),
                 "in_flight": sum(s["in_flight"] or 0 for s in sources),
+                **latest_ttft(sources),
                 "sources": sources,
             },
             "power": power,
