@@ -10,7 +10,7 @@ swiftc -O -swift-version 5 -target arm64-apple-macos14.0 -o "$APP/Contents/MacOS
     -framework SwiftUI -framework AppKit -framework Charts
 
 # The background service: gpud plus a prebuilt power helper, so users need no compiler.
-cp ../daemon/gpud.py ../daemon/gpupower.c ../daemon/prices.json "$APP/Contents/Resources/daemon/"
+cp ../daemon/gpud.py ../daemon/llmproxy.py ../daemon/gpupower.c ../daemon/prices.json "$APP/Contents/Resources/daemon/"
 clang -O2 -arch arm64 -mmacosx-version-min=14.0 -o "$APP/Contents/Resources/daemon/gpupower" \
     ../daemon/gpupower.c -framework CoreFoundation -framework IOKit -lIOReport
 

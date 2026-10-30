@@ -17,6 +17,10 @@ serves them over a local HTTP API:
   GET /api/v1/power        -> chip power right now (GPU, CPU, ANE, DRAM) and energy per token
   GET /api/v1/explain      -> what each busy script is doing, in plain English (?pid=N for one,
                               with the evidence used; &refresh=1 to ask again)
+  GET /api/v1/llm-proxy/log -> the request log itself, newest first (?limit=2000; this Mac only)
+  GET /api/v1/llm-proxy    -> the LLM request log: settings, requests running now and the latest ones
+                              (this Mac only; POST JSON to change: enabled, snippets, allow, new_api_key,
+                              remove_api_key, retention_days; see llmproxy.py)
   GET /api/v1/cost         -> what the period's tokens would cost on frontier cloud models
                               (?preset=… or ?from=&to=, &cache_hit=0..0.95, &batch=1,
                               &thinking=0..3, &tokenizer=0.5..2)
@@ -60,7 +64,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.12.0"
+import llmproxy
+
+VERSION = "1.13.0"
 RETENTION_SECONDS = 24 * 3600
 STATE_DIR = os.path.expanduser("~/Library/Application Support/GPUBuddy")
 DEFAULT_DB = os.path.join(STATE_DIR, "history.db")
@@ -190,7 +196,7 @@ PROM_TTFT_COUNT = ("vllm:time_to_first_token_seconds_count", "sglang:time_to_fir
 
 def latest_ttft(sources):
     """Time to first token for the status payload: the most recent request across all servers that report it."""
-    keys = ("ttft_s", "ttft_avg_s", "ttft_model", "ttft_prompt_tokens", "ttft_cache", "ttft_samples")
+    keys = ("ttft_s", "ttft_avg_s", "ttft_model", "ttft_prompt_tokens", "ttft_cache", "ttft_samples", "ttft_pending_since")
     have = [s for s in sources if s.get("ttft_avg_s") is not None]
     if not have:
         return dict.fromkeys(keys)
@@ -287,6 +293,20 @@ class TokenWatcher:
             sm, latest, srv = d.get("summary", {}), d.get("latest") or {}, d.get("server") or {}
             model = model_name(srv.get("loaded_model") or latest.get("model"))
             ttft = self._mlx_ttft(d, latest, srv)
+            # A request still running: the server only reports first-token time once a request finishes (and doesn't
+            # say when a running one started), so note the time whenever its started-count goes up, drop the oldest
+            # when one finishes, and let the app count up live from the oldest one still running.
+            n_started = sm.get("requests_started") or 0
+            n_done = (sm.get("requests_completed") or 0) + (sm.get("requests_failed") or 0)
+            starts = src.setdefault("starts", [])
+            if "n_started" in src and n_started >= src["n_started"]:
+                starts.extend([time.time()] * min(8, n_started - src["n_started"]))
+                del starts[:max(0, n_done - src["n_done"])]
+            src["n_started"], src["n_done"] = n_started, n_done
+            if not sm.get("in_flight"):
+                starts.clear()
+            if ttft is not None and starts:
+                ttft["pending_since"] = starts[0]
             return (sm.get("prompt_tokens_total", 0), sm.get("completion_tokens_total", 0),
                     sm.get("in_flight", 0), latest.get("decode_tok_s", 0) or 0, model, ttft)
         if src["kind"] == "prometheus":
@@ -390,7 +410,8 @@ class TokenWatcher:
                      "ttft_model": (s["ttft"]["model"] or s["model"]) if s["ttft"] else None,
                      "ttft_prompt_tokens": s["ttft"]["prompt"] if s["ttft"] else None,
                      "ttft_cache": s["ttft"]["cache"] if s["ttft"] else None,
-                     "ttft_samples": s["ttft"]["n"] if s["ttft"] else None}
+                     "ttft_samples": s["ttft"]["n"] if s["ttft"] else None,
+                     "ttft_pending_since": s["ttft"].get("pending_since") if s["ttft"] else None}
                     for s in self.sources.values()]
         return int(gen), int(prompt), view, by
 
@@ -480,9 +501,12 @@ class Explainer:
     """
 
     REFRESH = 600  # ask again at most every 10 minutes per process, and only if the evidence changed
-    SYSTEM = ("You explain what a computer program is doing to a non-programmer. Answer with one or two short, "
-              "plain-English sentences: what it is doing right now, on what, and how far along it is if that's known. "
-              "No code words, no technical jargon, and no file paths longer than the last two folders.")
+    SYSTEM = ("You tell a non-programmer, at a glance, what a computer program is doing. Answer with JSON only: "
+              '{"headline": "...", "facts": ["...", "..."]}. headline: what it is doing right now, 2 to 5 plain words, '
+              'starting with a verb ("Extracting audio from videos"). facts: up to 3 short precise details, each 1 to 4 '
+              'words, most useful first: progress with numbers ("5,960 / 8,164 videos"), time left ("~11 h left"), '
+              'what it works on ("Family Media drive"), speed. Only facts the evidence shows; no guesses, no jargon, '
+              "no file paths, no full sentences.")
     SKIP_FILES = ("/venv/", "/site-packages/", "/System/", "/usr/", "/Library/Caches/", "/private/var/", "/dev/",
                   "/.cache/", "/Frameworks/", "/opt/homebrew/Cellar/", "/node_modules/")
     SKIP_EXT = (".so", ".dylib", ".pyc", ".py", ".js", ".dat", ".db-shm", ".db-wal", ".list", ".data", ".weights")
@@ -589,20 +613,20 @@ class Explainer:
 
     @staticmethod
     def rules(p, ev):
-        """A sentence without an LLM, from the same evidence."""
+        """A headline and facts without an LLM, from the same evidence."""
         doc = re.search(r'"""\s*(.+?)(?:\n\n|""")', ev["script"], re.S) or re.search(r"^#(?!!)\s*(.+)$", ev["script"], re.M)
         what = (doc.group(1).strip().split("\n")[0].rstrip(".") if doc else p.get("activity") or p["name"])
-        bits = [what[:1].upper() + what[1:]]
+        facts = []
         if ev["children"]:
             tool = os.path.basename(ev["children"][0].split()[0])
             target = os.path.basename(ev["children"][0].split()[-1])
-            bits.append(f"right now {tool} is working on {target}")
-        if ev["talks_to"]:
-            bits.append("talking to " + ev["talks_to"][0])
+            facts.append(f"{tool}: {target}"[:40])
+        if ev["elapsed"]:
+            facts.append(f"running {ev['elapsed']}")
         last = ev["log"].strip().splitlines()[-1] if ev["log"].strip() else ""
         if last:
-            bits.append(f"latest log: {last[-120:]}")
-        return "; ".join(bits) + "."
+            facts.append(last[-40:])
+        return (what[:1].upper() + what[1:])[:80], facts[:3]
 
     # --- asking a local model
 
@@ -635,14 +659,23 @@ class Explainer:
 
     def _ask(self, endpoint, text):
         base, model = endpoint
-        body = json.dumps({"model": model, "max_tokens": 120, "temperature": 0.2, "stream": False,
+        body = json.dumps({"model": model, "max_tokens": 160, "temperature": 0.2, "stream": False,
                            "messages": [{"role": "system", "content": self.SYSTEM},
                                         {"role": "user", "content": text}]}).encode()
         req = urllib.request.Request(base + "/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=90) as r:
             answer = json.loads(r.read())["choices"][0]["message"]["content"] or ""
         answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.S).strip()
-        return answer.split("\n\n")[0].strip()
+        m = re.search(r"\{.*\}", answer, re.S)
+        try:
+            d = json.loads(m.group(0)) if m else {}
+        except ValueError:
+            d = {}
+        headline = str(d.get("headline") or "").strip().rstrip(".")
+        facts = [str(f).strip().rstrip(".") for f in (d.get("facts") or []) if str(f).strip()][:3]
+        if not headline:  # not JSON after all: keep its first sentence
+            headline = re.split(r"(?<=[.!?])\s", answer.split("\n\n")[0].strip())[0].rstrip(".")
+        return headline[:80], [f[:40] for f in facts]
 
     # --- loop
 
@@ -672,16 +705,16 @@ class Explainer:
             with self.lock:
                 old["evidence"] = ev  # keep the live details fresh
             return old
-        text, source = None, "rules"
+        text, facts, source = None, [], "rules"
         endpoint = self._endpoint() if self.enabled else None
         if endpoint:
             try:
-                text, source = self._ask(endpoint, self.render(ev)), "local-llm"
+                (text, facts), source = self._ask(endpoint, self.render(ev)), "local-llm"
             except Exception as e:
                 print(f"gpud: explain failed for pid {p['pid']}: {e}", file=sys.stderr, flush=True)
         if not text:
-            text, source = self.rules(p, ev), "rules"
-        entry = {"text": text, "source": source, "at": now, "evidence": ev, "key": key,
+            (text, facts), source = self.rules(p, ev), "rules"
+        entry = {"text": text, "facts": facts, "source": source, "at": now, "evidence": ev, "key": key,
                  "model": os.path.basename(str(endpoint[1]).rstrip("/")) if endpoint and source == "local-llm" else None}
         with self.lock:
             self.cache[p["pid"]] = entry
@@ -783,7 +816,8 @@ class HistoryDB:
         self._pending = 0
 
     def add(self, snap, by_model=None, energy=None, model_energy=None):
-        keys = ("pid", "name", "gpu_percent", "is_ai", "activity", "command", "cwd", "tok_s", "explain")
+        keys = ("pid", "name", "gpu_percent", "is_ai", "activity", "command", "cwd", "tok_s", "explain", "explain_facts",
+                "explain_icon")
         procs = [{k: p[k] for k in keys if k in p} for p in snap["processes"][:5]]
         with self.lock:
             top = top_process(procs) or ("", 0, 0)
@@ -972,7 +1006,8 @@ class HistoryDB:
                            "generated_delta": tok_gen or 0, "prompt_delta": tok_prompt or 0,
                            "generated_24h": day_gen, "prompt_24h": day_prompt,
                            "speed_tok_s": 0, "in_flight": 0, "ttft_s": None, "ttft_avg_s": None, "ttft_model": None,
-                           "ttft_prompt_tokens": None, "ttft_cache": None, "ttft_samples": None, "sources": []}}
+                           "ttft_prompt_tokens": None, "ttft_cache": None, "ttft_samples": None,
+                           "ttft_pending_since": None, "sources": []}}
 
 
 class GPUSampler:
@@ -1118,11 +1153,17 @@ class GPUSampler:
                 e = self.explainer.get(p["pid"])
                 if e:
                     p["explain"] = e["text"]
+                    p["explain_facts"] = e.get("facts") or []
         speed = {s["pid"]: s for s in sources if s["pid"]}
+        doing = self.proxy.now_doing() if getattr(self, "proxy", None) else None
         for p in active:
             if p["pid"] in speed:
                 p["tok_s"] = speed[p["pid"]]["tok_s"]
                 p["is_ai"] = True
+                if doing:  # the LLM server: say who it's working for, from the request log
+                    p.update(explain=doing["headline"], explain_facts=doing["facts"], explain_icon=doing["icon"])
+                    if doing.get("quote"):
+                        p["explain_quote"] = doing["quote"]
         dt = (now - self._prev_ts) if self._prev_ts else 0.0
         self._prev_ts = now
         st = self._static
@@ -1218,6 +1259,7 @@ class GPUSampler:
                 "sources": sources,
             },
             "power": power,
+            "llm_requests": self.proxy.summary() if getattr(self, "proxy", None) else None,
             "fun": {
                 "est_peak_tflops": st["est_peak_tflops"],
                 "est_current_tflops": round(util / 100 * st["est_peak_tflops"], 2),
@@ -1569,6 +1611,16 @@ def cloud_cost(usage, cache_hit=0.0, batch=False, thinking=0.0, tokenizer=1.0, r
             "models": rows}
 
 
+def public_snapshot(snap):
+    """A snapshot for paired Macs: what people typed (request snippets) stays on this Mac."""
+    lr = snap.get("llm_requests")
+    procs = [{k: v for k, v in p.items() if k != "explain_quote"} for p in snap["processes"]]
+    if not lr:
+        return dict(snap, processes=procs)
+    strip = lambda rs: [{k: v for k, v in r.items() if k != "snippet"} for r in rs]
+    return dict(snap, processes=procs, llm_requests=dict(lr, active=strip(lr["active"]), recent=strip(lr["recent"])))
+
+
 def make_handler(sampler, identity=None, remote=False):
     """remote=True: the TLS listener for other Macs, where every request needs the token."""
     class Handler(BaseHTTPRequestHandler):
@@ -1579,12 +1631,16 @@ def make_handler(sampler, identity=None, remote=False):
         def log_message(self, *args):
             pass
 
-        def _json(self, obj, code=200):
+        def _private(self):
+            """Not for web pages: remote viewers, or a browser (it always sends Origin; the app never does)."""
+            return remote or "Origin" in self.headers
+
+        def _json(self, obj, code=200, cors=True):
             body = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            if not remote:
+            if not remote and cors:
                 self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             try:
@@ -1618,7 +1674,7 @@ def make_handler(sampler, identity=None, remote=False):
                 if snap is None:
                     return self._json({"error": "warming up"}, 503)
                 top = dict(snap, processes=snap["processes"][:5])
-                return self._json(top)
+                return self._json(public_snapshot(top) if self._private() else top)
             if url.path == "/api/v1/processes":
                 with sampler.lock:
                     snap = sampler.latest
@@ -1661,7 +1717,8 @@ def make_handler(sampler, identity=None, remote=False):
                         return self._json({"error": "that process isn't using the GPU right now"}, 404)
                     return self._json(dict({k: v for k, v in entry.items() if k != "key"}, pid=pid))
                 with ex.lock:
-                    return self._json({"processes": [{"pid": pid, "text": e["text"], "source": e["source"], "at": e["at"],
+                    return self._json({"processes": [{"pid": pid, "text": e["text"], "facts": e.get("facts", []),
+                                                      "source": e["source"], "at": e["at"],
                                                       "model": e["model"]} for pid, e in ex.cache.items()]})
             if url.path == "/api/v1/power":
                 with sampler.lock:
@@ -1732,7 +1789,36 @@ def make_handler(sampler, identity=None, remote=False):
                 return self._json({"history": entries, "count": len(entries)})
             if url.path == "/api/v1/stream":
                 return self._stream()
+            if url.path == "/api/v1/llm-proxy" and not self._private() and self._loopback_host():
+                return self._json(dict(sampler.proxy.status(), **sampler.proxy.summary(50)), cors=False)
+            if url.path == "/api/v1/llm-proxy/log" and not self._private() and self._loopback_host():
+                try:
+                    limit = max(1, min(int(q.get("limit", ["2000"])[0]), 20000))
+                except ValueError:
+                    limit = 2000
+                return self._json({"on": sampler.proxy.state == "on", "active": sampler.proxy.summary(0)["active"],
+                                   "entries": sampler.proxy.history(limit)}, cors=False)
             return self._json({"error": "not found"}, 404)
+
+        def _loopback_host(self):
+            """Addressed to loopback, so a web page can't reach it through DNS rebinding."""
+            return self.headers.get("Host", "").rsplit(":", 1)[0] in ("127.0.0.1", "localhost", "[::1]")
+
+        def do_POST(self):
+            # Settings changes: only from apps on this Mac. JSON only, which a web page can't send to another
+            # site without a preflight this server never answers.
+            if self._private() or urlparse(self.path).path != "/api/v1/llm-proxy" or not self._loopback_host():
+                return self._json({"error": "not found"}, 404, cors=False)
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return self._json({"error": "send JSON"}, 415, cors=False)
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                change = json.loads(self.rfile.read(n)) if 0 < n < 65536 else None
+                if not isinstance(change, dict):
+                    raise ValueError("send a JSON object")
+                return self._json(sampler.proxy.configure(change), cors=False)
+            except (ValueError, TypeError) as e:
+                return self._json({"error": str(e)}, 400, cors=False)
 
         def _stream(self):
             self.send_response(200)
@@ -1743,6 +1829,7 @@ def make_handler(sampler, identity=None, remote=False):
                 self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.close_connection = True
+            private = self._private()
             last = None
             try:
                 while True:
@@ -1753,7 +1840,7 @@ def make_handler(sampler, identity=None, remote=False):
                         self.wfile.write(b": keepalive\n\n")
                     else:
                         last = snap
-                        self.wfile.write(b"data: " + json.dumps(snap).encode() + b"\n\n")
+                        self.wfile.write(b"data: " + json.dumps(public_snapshot(snap) if private else snap).encode() + b"\n\n")
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -1804,6 +1891,7 @@ def main():
     sampler = GPUSampler(args.interval, HistoryDB(args.db), tokens, power)
     sampler.remote_port = args.remote_port
     sampler.explainer = Explainer(sampler, tokens)
+    sampler.proxy = llmproxy.LLMProxy()
     threading.Thread(target=sampler.explainer.loop, daemon=True).start()
     threading.Thread(target=sampler.loop, daemon=True).start()
 

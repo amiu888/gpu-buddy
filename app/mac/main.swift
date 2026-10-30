@@ -65,8 +65,22 @@ enum Service {
     }
 
     static func uninstall() {
+        turnOffRequestLog()
         launchctl(["bootout", "gui/\(getuid())/\(label)"])
         try? FileManager.default.removeItem(at: plist)
+    }
+
+    /// If gpud's LLM request log moved the LLM server to another port, put it back before gpud goes away
+    /// (apps would otherwise lose the server). Waits up to a minute for the server to restart.
+    static func turnOffRequestLog() {
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:8765/api/v1/llm-proxy")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data(#"{"enabled": false}"#.utf8)
+        req.timeoutInterval = 60
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { _, _, _ in done.signal() }.resume()
+        _ = done.wait(timeout: .now() + 60)
     }
 
     @discardableResult
@@ -104,6 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var aboutWindow: NSWindow?
     var settingsWindow: NSWindow?
     var ledgerWindow: NSWindow?
+    var requestLogWindow: NSWindow?
     var macsWindow: NSWindow?
     private var port = 8765
     private var lastIcon = -2
@@ -113,6 +128,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         fleet = Fleet(localPort: port)
         fleet.onUpdate = { [weak self] s in self?.updateDockIcon(s) }
         fleet.onOpenLedger = { [weak self] in self?.openLedger() }
+        NotificationCenter.default.addObserver(forName: .openRequestLog, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.openRequestLog() }
+        }
         fleet.onOpenMacs = { [weak self] in self?.openMacs() }
         fleet.onSelect = { [weak self] in self?.hostChanged() }
         fleet.onCompactChange = { [weak self] in
@@ -217,6 +235,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let ledger = NSMenuItem(title: "Token Ledger…", action: #selector(openLedger), keyEquivalent: "l")
         ledger.target = self
         appMenu.addItem(ledger)
+        let requests = NSMenuItem(title: "Request Log…", action: #selector(openRequestLog), keyEquivalent: "r")
+        requests.target = self
+        appMenu.addItem(requests)
         appMenu.addItem(.separator())
         for (title, action, key) in [("Macs…", #selector(openMacs), "k"), ("Next Mac", #selector(nextMac), "]"),
                                      ("Previous Mac", #selector(previousMac), "["), ("Next Character", #selector(nextCharacter), "j"),
@@ -266,6 +287,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             ledgerWindow = w
         }
         ledgerWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func openRequestLog() {
+        if requestLogWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 560),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                             backing: .buffered, defer: false)
+            w.titlebarAppearsTransparent = true
+            w.titleVisibility = .hidden
+            w.title = "Request Log"
+            w.contentMinSize = NSSize(width: 700, height: 300)
+            w.isReleasedWhenClosed = false
+            w.backgroundColor = window.backgroundColor
+            w.appearance = NSAppearance(named: .darkAqua)
+            w.contentView = NSHostingView(rootView: RequestLogView())
+            w.setFrameAutosaveName("GPUBuddyRequestLog")
+            if !w.setFrameUsingName("GPUBuddyRequestLog") { w.center() }
+            requestLogWindow = w
+        }
+        requestLogWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc func toggleCompact() {
@@ -322,7 +363,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc func openSettings() {
         if settingsWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 420),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 720),
                              styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
             w.titlebarAppearsTransparent = true
             w.titleVisibility = .hidden

@@ -85,8 +85,12 @@ struct Snapshot: Decodable {
         let command: String?
         let cwd: String?
         let tok_s: Double?
-        /// What it's doing, in plain English (from gpud's explainer).
+        /// What it's doing, in plain English (from gpud's explainer): a short headline, a few facts,
+        /// and for an LLM server the request it's working on (icon, and the user's words if snippets are on).
         let explain: String?
+        let explain_facts: [String]?
+        let explain_icon: String?
+        let explain_quote: String?
         var id: Int { pid }
 
         /// "train.py · ~/projects/demo"
@@ -133,6 +137,7 @@ struct Snapshot: Decodable {
         let ttft_prompt_tokens: Double?  // prompt size of that request (first-token time mostly depends on it)
         let ttft_cache: Bool?            // the server's prompt cache was on for it
         let ttft_samples: Double?        // requests in the average (same model and cache setting)
+        let ttft_pending_since: Double?  // unix time a request still running started (its time comes when it finishes)
         let sources: [Source]
     }
     struct Power: Decodable {
@@ -157,6 +162,13 @@ struct Snapshot: Decodable {
     let fun: Fun
     let tokens: Tokens?
     let power: Power?
+    /// Who's using the local LLM server, from gpud's request log (nil from older gpud versions).
+    let llm_requests: LLMRequests?
+    struct LLMRequests: Decodable {
+        let on: Bool
+        let active: [LLMRequest]
+        let recent: [LLMRequest]
+    }
     let host: HostInfo?
 }
 
@@ -478,6 +490,16 @@ final class Fleet: ObservableObject {
             onCompactChange?()
         }
     }
+    /// Sections of the full view that are folded away (remembered between launches).
+    @Published var collapsed = Set(UserDefaults.standard.stringArray(forKey: "collapsedSections") ?? []) {
+        didSet {
+            UserDefaults.standard.set(Array(collapsed).sorted(), forKey: "collapsedSections")
+            onCompactChange?()  // the window refits to its new height
+        }
+    }
+    func toggleSection(_ id: String) {
+        if collapsed.contains(id) { collapsed.remove(id) } else { collapsed.insert(id) }
+    }
     var onCompactChange: (() -> Void)?
     var onSelect: (() -> Void)?
     var onUpdate: ((GPUStore) -> Void)?
@@ -675,7 +697,8 @@ final class Anim {
         mem += (memTarget - mem) * min(1, dt * 2)
         runPhase += dt * (util < 0.05 ? 0 : 1.2 + util * 4.5)
         fanPhase += dt * (1.5 + util * 28)
-        scroll += dt * util * 260
+        // The road moves with the GPU: stopped when idle, faster as the load goes up.
+        scroll += dt * (util < 0.02 ? 0 : 40 + util * 300)
         wave += dt * (1.5 + util * 4)
         if time > blinkAt + 0.12 { blinkAt = time + 2 + hash(time) * 3 }
 
@@ -865,6 +888,9 @@ struct SceneCanvas: View {
     var character: CharacterKind = .chippy
     /// Full view: the temperature and first-token badges sit top-left, so the character moves a little right and shrinks a touch.
     var roomForBadges = false
+    /// The animation clock for this frame. `anim` is the same object every frame, so without a value that changes
+    /// SwiftUI sees identical inputs and skips redrawing: the road and the character would freeze.
+    var frameTime: Double = 0
 
     var body: some View {
         Canvas { ctx, size in
@@ -1297,11 +1323,42 @@ struct SceneCanvas: View {
         // Rolling grassy hill + treadmill dashes.
         ctx.fill(Path(roundedRect: CGRect(x: -20, y: groundY, width: w + 40, height: 60), cornerRadius: 24),
                  with: .color(Color(hue: (a.hue + 0.5).truncatingRemainder(dividingBy: 1), saturation: 0.25, brightness: 0.3).opacity(0.7)))
+        // Lane dashes scroll at the road's speed and stretch into streaks when the GPU is busy.
         let dash = 22.0
+        let streak = 8 + 10 * u
         var x = -a.scroll.truncatingRemainder(dividingBy: dash)
         while x < w {
-            ctx.fill(Path(roundedRect: CGRect(x: x, y: groundY + 7, width: 8, height: 3), cornerRadius: 1.5), with: .color(.white.opacity(0.22)))
+            ctx.fill(Path(roundedRect: CGRect(x: x, y: groundY + 7, width: streak, height: 3), cornerRadius: 1.5),
+                     with: .color(.white.opacity(0.22 + 0.13 * u)))
             x += dash
+        }
+        // Roadside grass tufts and little posts passing by, so the speed is easy to see.
+        let span = 70.0
+        var gx = -(a.scroll * 1.15).truncatingRemainder(dividingBy: span)
+        var k = Int((a.scroll * 1.15 / span).rounded(.down))
+        while gx < w + 10 {
+            let r = hash(Double(k) * 7.3)
+            let px = gx + r * 30
+            let tuftY = groundY + 18
+            if r < 0.35 {  // a small post with a light on top
+                ctx.fill(Path(roundedRect: CGRect(x: px, y: tuftY - 6, width: 2.5, height: 9), cornerRadius: 1),
+                         with: .color(.white.opacity(0.28)))
+                ctx.fill(Path(ellipseIn: CGRect(x: px - 0.5, y: tuftY - 8, width: 3.5, height: 3.5)),
+                         with: .color(Color(hue: (a.hue + r).truncatingRemainder(dividingBy: 1), saturation: 0.5, brightness: 1).opacity(0.7)))
+            } else {  // a grass tuft, leaning back more the faster it goes
+                let lean = 1.5 + 4 * u
+                for b in 0..<3 {
+                    var blade = Path()
+                    let bx = px + Double(b) * 2.5
+                    blade.move(to: CGPoint(x: bx, y: tuftY + 2))
+                    blade.addQuadCurve(to: CGPoint(x: bx - lean, y: tuftY - 4 - Double(b % 2) * 1.5),
+                                       control: CGPoint(x: bx + 0.5, y: tuftY - 1))
+                    ctx.stroke(blade, with: .color(Color(red: 0.55, green: 0.85, blue: 0.55).opacity(0.45)),
+                               style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
+                }
+            }
+            gx += span
+            k += 1
         }
 
         // Swooshy speed lines.
@@ -1381,19 +1438,35 @@ struct SceneCanvas: View {
     }
 }
 
-/// Content width shared by the temperature and first-token badges, so they line up as a matching pair.
-let badgeInnerWidth = 83.0
+/// The badges are drawn at 80% of their design size, so they stay clear of the character.
+let badgeScale = 0.8
 
 /// A little thermometer friend for the scene's top-left corner: the GPU temperature, with a face that
 /// shivers when it's cold, sweats when it's toasty and steams when it's hot. Click to switch °C / °F.
 struct ThermoBuddy: View {
+    private let k: Double  // drawn at this size directly (not scaled afterwards) so text stays sharp
     let celsius: Double
     let time: Double
+    let mini: Bool
     @AppStorage("tempFahrenheit") private var fahrenheit = false
 
-    init(celsius: Double, time: Double) {
+    /// `mini`: a small chip (little thermometer + temperature) for the compact view.
+    init(celsius: Double, time: Double, mini: Bool = false) {
         self.celsius = celsius
         self.time = time
+        self.mini = mini
+        self.k = mini ? 0.42 : badgeScale
+    }
+
+    private var degrees: String {
+        fahrenheit ? "\(Int((celsius * 9 / 5 + 32).rounded()))°F" : "\(Int(celsius.rounded()))°C"
+    }
+
+    /// "55°C · warm" (or °F, following the badge's setting), for places that show the temperature as text.
+    static func text(_ c: Double, fahrenheit: Bool) -> String {
+        let t = fahrenheit ? "\(Int((c * 9 / 5 + 32).rounded()))°F" : "\(Int(c.rounded()))°C"
+        let word = c < 40 ? "chilly" : c < 55 ? "comfy" : c < 70 ? "warm" : c < 85 ? "toasty" : "spicy!"
+        return "\(t) · \(word)"
     }
 
     private enum Feel { case chilly, comfy, warm, toasty, spicy }
@@ -1426,21 +1499,41 @@ struct ThermoBuddy: View {
     }
 
     var body: some View {
-        HStack(spacing: 4) {
+        if mini { miniBody } else { fullBody }
+    }
+
+    private var miniBody: some View {
+        HStack(spacing: 2) {
             Canvas { ctx, size in draw(&ctx, size) }
-                .frame(width: 26, height: 42)
-            VStack(alignment: .leading, spacing: -1) {
+                .frame(width: 26 * k, height: 42 * k)
+            Text(degrees)
+                .font(.system(size: 10, weight: .heavy, design: .rounded)).monospacedDigit()
+                .foregroundColor(color)
+                .lineLimit(1).fixedSize()
+        }
+        .padding(.leading, 3).padding(.trailing, 6).padding(.vertical, 1)
+        .background(Capsule().fill(.white.opacity(0.08)))
+        .contentShape(Capsule())
+        .onTapGesture { fahrenheit.toggle() }
+        .help("GPU temperature: \(degrees), \(label). Click to switch °C / °F.")
+    }
+
+    private var fullBody: some View {
+        HStack(spacing: 4 * k) {
+            Canvas { ctx, size in draw(&ctx, size) }
+                .frame(width: 26 * k, height: 42 * k)
+            VStack(alignment: .leading, spacing: -1 * k) {
                 Text(fahrenheit ? "\(Int((celsius * 9 / 5 + 32).rounded()))°F" : "\(Int(celsius.rounded()))°C")
-                    .font(.system(size: 15, weight: .heavy, design: .rounded)).monospacedDigit()
+                    .font(.system(size: 16 * k, weight: .heavy, design: .rounded)).monospacedDigit()
                     .foregroundColor(.white)
                 Text(label)
-                    .font(.system(size: 8.5, weight: .black, design: .rounded))
+                    .font(.system(size: 9.5 * k, weight: .black, design: .rounded))
                     .foregroundColor(color)
             }
             .fixedSize()
         }
-        .frame(width: badgeInnerWidth, alignment: .leading)
-        .padding(.leading, 4).padding(.trailing, 10).padding(.vertical, 3)
+        .frame(maxWidth: .infinity, alignment: .leading)  // as wide as the wider badge (see the stack in ContentView)
+        .padding(.leading, 4 * k).padding(.trailing, 10 * k).padding(.vertical, 3 * k)
         .background(Capsule().fill(Color(red: 0.08, green: 0.07, blue: 0.12).opacity(0.82)))
         .overlay(Capsule().stroke(color.opacity(0.35 + (feel == .spicy ? 0.3 * sin(time * 8) : 0)), lineWidth: 1))
         .contentShape(Capsule())
@@ -1449,6 +1542,7 @@ struct ThermoBuddy: View {
     }
 
     private func draw(_ ctx: inout GraphicsContext, _ size: CGSize) {
+        ctx.scaleBy(x: k, y: k)
         let t = time
         // Shiver when chilly, a slow happy sway otherwise.
         let dx = feel == .chilly ? sin(t * 45) * 0.7 : sin(t * 1.6) * 0.5
@@ -1545,12 +1639,17 @@ struct ThermoBuddy: View {
 /// token). Its face and hand speed follow the time: zippy and spinning when it's fast, sleepy when it's slow.
 /// The numbers follow the latest request's model and prompt-cache setting (gpud starts the average over when they change).
 struct StopwatchBuddy: View {
+    private let k: Double  // drawn at this size directly (not scaled afterwards) so text stays sharp
     let tokens: Snapshot.Tokens
     let time: Double
+    let mini: Bool
 
-    init(tokens: Snapshot.Tokens, time: Double) {
+    /// `mini`: a small chip (little stopwatch + first-token time) for the compact view.
+    init(tokens: Snapshot.Tokens, time: Double, mini: Bool = false) {
         self.tokens = tokens
         self.time = time
+        self.mini = mini
+        self.k = mini ? 0.5 : badgeScale
     }
 
     private var seconds: Double { tokens.ttft_s ?? tokens.ttft_avg_s ?? 0 }
@@ -1607,60 +1706,99 @@ struct StopwatchBuddy: View {
     }
 
     var body: some View {
-        HStack(spacing: 4) {
+        if mini { miniBody } else { fullBody }
+    }
+
+    private var miniBody: some View {
+        HStack(spacing: 2) {
             Canvas { ctx, size in draw(&ctx, size) }
-                .frame(width: 26, height: 34)
-            VStack(alignment: .leading, spacing: -1) {
-                HStack(spacing: 3) {
+                .frame(width: 26 * k, height: 34 * k)
+            Text(ttftText(seconds))
+                .font(.system(size: 10, weight: .heavy, design: .rounded)).monospacedDigit()
+                .foregroundColor(color)
+                .lineLimit(1).fixedSize()
+            if let since = tokens.ttft_pending_since {  // a request is running: count up live
+                Text("⏳\(ttftText(max(0, Date().timeIntervalSince1970 - since)))")
+                    .font(.system(size: 8.5, weight: .bold, design: .rounded)).monospacedDigit()
+                    .foregroundColor(.white.opacity(0.75))
+                    .lineLimit(1).fixedSize()
+            }
+        }
+        .padding(.leading, 3).padding(.trailing, 6).padding(.vertical, 1)
+        .background(Capsule().fill(.white.opacity(0.08)))
+        .help(helpText)
+    }
+
+    private var fullBody: some View {
+        HStack(spacing: 4 * k) {
+            Canvas { ctx, size in draw(&ctx, size) }
+                .frame(width: 26 * k, height: 34 * k)
+            VStack(alignment: .leading, spacing: -1 * k) {
+                HStack(spacing: 3 * k) {
                     Text("1ST TOKEN")
-                        .font(.system(size: 6.5, weight: .black, design: .rounded))
-                        .foregroundColor(.white.opacity(0.55))
+                        .font(.system(size: 7.5 * k, weight: .black, design: .rounded))
+                        .foregroundColor(.white.opacity(0.72))
                     if let c = tokens.ttft_cache {  // tiny bolt: prompt cache on (filled) or off (crossed out)
                         Image(systemName: c ? "bolt.fill" : "bolt.slash.fill")
-                            .font(.system(size: 5.5, weight: .heavy))
+                            .font(.system(size: 5.5 * k, weight: .heavy))
                             .foregroundColor(c ? .black.opacity(0.75) : .white.opacity(0.6))
-                            .frame(width: 10, height: 10)
+                            .frame(width: 10 * k, height: 10 * k)
                             .background(Circle().fill(c ? color : .white.opacity(0.14)))
                     }
                 }
                 Text(ttftText(seconds))
-                    .font(.system(size: 15, weight: .heavy, design: .rounded)).monospacedDigit()
+                    .font(.system(size: 16 * k, weight: .heavy, design: .rounded)).monospacedDigit()
                     .foregroundColor(.white)
                     .contentTransition(.numericText())
                     .animation(.snappy, value: seconds)
                 Text(label)
-                    .font(.system(size: 8.5, weight: .black, design: .rounded))
+                    .font(.system(size: 9.5 * k, weight: .black, design: .rounded))
                     .foregroundColor(color)
                 // How much it read before answering: the prompt is what the first-token wait is spent on.
                 if let p = tokens.ttft_prompt_tokens, p > 0 {
-                    HStack(spacing: 2.5) {
+                    HStack(spacing: 2.5 * k) {
                         Image(systemName: "book.fill")
-                            .font(.system(size: 6.5, weight: .bold))
+                            .font(.system(size: 9 * k, weight: .bold))
                             .foregroundColor(color)
                         Text("\(shortCount(p)) read")
-                            .font(.system(size: 8, weight: .heavy, design: .rounded)).monospacedDigit()
-                            .foregroundColor(.white.opacity(0.85))
+                            .font(.system(size: 11 * k, weight: .heavy, design: .rounded)).monospacedDigit()
+                            .foregroundColor(.white.opacity(0.95))
                             .contentTransition(.numericText())
                             .animation(.snappy, value: p)
                     }
-                    .padding(.top, 1.5)
+                    .padding(.top, 1.5 * k)
+                }
+                // A request is running now: count up live until its first-token time comes in.
+                if let since = tokens.ttft_pending_since {
+                    let waited = max(0, Date().timeIntervalSince1970 - since)
+                    HStack(spacing: 2.5 * k) {
+                        Image(systemName: "hourglass")
+                            .font(.system(size: 8.5 * k, weight: .bold))
+                            .foregroundColor(color)
+                            .rotationEffect(.degrees(waited.truncatingRemainder(dividingBy: 2) < 1 ? 0 : 180))
+                        Text("now \(ttftText(waited))")
+                            .font(.system(size: 9.5 * k, weight: .heavy, design: .rounded)).monospacedDigit()
+                            .foregroundColor(.white.opacity(0.95))
+                    }
+                    .help("A new request is running. Its first-token time shows up here when it finishes.")
                 }
                 if let avg = average {
                     Text("avg \(ttftText(avg))")
-                        .font(.system(size: 7.5, weight: .bold, design: .rounded)).monospacedDigit()
-                        .foregroundColor(.white.opacity(0.5))
+                        .font(.system(size: 8.5 * k, weight: .bold, design: .rounded)).monospacedDigit()
+                        .foregroundColor(.white.opacity(0.68))
                 }
             }
             .fixedSize()
         }
-        .frame(width: badgeInnerWidth, alignment: .leading)
-        .padding(.leading, 4).padding(.trailing, 10).padding(.vertical, 4)
-        .background(RoundedRectangle(cornerRadius: 16).fill(Color(red: 0.08, green: 0.07, blue: 0.12).opacity(0.82)))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(color.opacity(0.4), lineWidth: 1))
+        .frame(maxWidth: .infinity, alignment: .leading)  // as wide as the wider badge (see the stack in ContentView)
+        .padding(.leading, 4 * k).padding(.trailing, 10 * k).padding(.vertical, 4 * k)
+        .background(RoundedRectangle(cornerRadius: 16 * k).fill(Color(red: 0.08, green: 0.07, blue: 0.12).opacity(0.82)))
+        .overlay(RoundedRectangle(cornerRadius: 16 * k).stroke(color.opacity(0.4), lineWidth: 1))
         .help(helpText)
     }
 
     private func draw(_ ctx: inout GraphicsContext, _ size: CGSize) {
+        ctx.scaleBy(x: k, y: k)
         let t = time
         let c = CGPoint(x: 13, y: 19), r = 10.0
         let ink = Color(red: 0.2, green: 0.12, blue: 0.25)
@@ -1694,7 +1832,7 @@ struct StopwatchBuddy: View {
         ctx.stroke(ring, with: .color(color), style: StrokeStyle(lineWidth: 2, lineCap: .round))
 
         // The hand: spins fast when zippy, creeps when slow.
-        let speed: Double = [Feel.zippy: 9, .quick: 4, .thinking: 1.5, .slow: 0.4][feel] ?? 1
+        let speed: Double = tokens.ttft_pending_since != nil ? 6 : ([Feel.zippy: 9, .quick: 4, .thinking: 1.5, .slow: 0.4][feel] ?? 1)
         let ang = t * speed
         var hand = Path()
         hand.move(to: c); hand.addLine(to: CGPoint(x: c.x + sin(ang) * (r - 4), y: c.y - cos(ang) * (r - 4)))
@@ -1924,6 +2062,153 @@ struct TokenCard: View {
     }
 }
 
+/// One request to the local LLM server, as gpud's request log saw it.
+struct LLMRequest: Decodable, Identifiable {
+    let id: String
+    let started: Double
+    let ip: String?
+    let agent: String?
+    let icon: String?
+    let who: String?          // this Mac's program (curl, node…) or the device's name
+    let app: String?          // the app that program runs in (iTerm, Visual Studio Code…)
+    let local: Bool?
+    let model: String?
+    let snippet: String?      // first 100 characters of the user's message, when snippets are on
+    let prompt_tokens: Double?
+    let output_tokens: Double?
+    let est_tokens: Double?        // prompt size guessed from the request's length, when the answer didn't say
+    let output_estimated: Bool?    // answer size counted from the streamed pieces
+    let ttft: Double?
+    let seconds: Double?
+    let status: Int?
+
+    /// "28.9K", or "~29K" when estimated.
+    var readText: String? { prompt_tokens.map(shortCount) ?? est_tokens.map { "~" + shortCount($0) } }
+    var wroteText: String? { output_tokens.map { (output_estimated == true ? "~" : "") + shortCount($0) } }
+    var readKey: Double { prompt_tokens ?? est_tokens ?? -1 }
+    let state: String?        // sending, waiting, answering, done, cancelled, blocked, error
+    let path: String?
+
+    var running: Bool { ["sending", "waiting", "answering"].contains(state ?? "") }
+
+    /// "curl in iTerm", "MacBook-Pro", "10.0.2.126".
+    var caller: String {
+        if local == true {
+            let w = who ?? "this Mac"
+            if let app, !app.isEmpty, app.lowercased() != w.lowercased() { return "\(w) in \(app)" }
+            return w
+        }
+        return who ?? ip ?? "?"
+    }
+}
+
+/// Who's using the local LLM server: requests running now (live) and the latest ones.
+struct RequestsCard: View {
+    let requests: Snapshot.LLMRequests
+    let time: Double
+    var onOpenLog: (() -> Void)?
+
+    private let green = Color(red: 0.45, green: 0.95, blue: 0.6)
+    private let orange = Color(red: 1, green: 0.62, blue: 0.35)
+
+    private var rows: [LLMRequest] {
+        Array((requests.active + requests.recent).prefix(max(3, requests.active.count)))
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            if rows.isEmpty {
+                Text("No requests yet. They show up here as soon as an app asks your LLM something.")
+                    .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.5))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            ForEach(rows) { row($0) }
+            if let onOpenLog {
+                Button(action: onOpenLog) {
+                    Text("📜 Open the request log").font(.system(size: 9.5, weight: .heavy, design: .rounded))
+                        .foregroundColor(.white.opacity(0.75))
+                        .frame(maxWidth: .infinity).padding(.vertical, 3)
+                        .background(Capsule().fill(.white.opacity(0.08)))
+                }
+                .buttonStyle(.plain)
+                .help("Every request from the last days: who, what, sizes and timings (⌘R)")
+            }
+        }
+    }
+
+    private func row(_ r: LLMRequest) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(r.icon ?? "❔").font(.system(size: 14))
+                .frame(width: 20)
+                .scaleEffect(r.state == "answering" ? 1 + 0.08 * sin(time * 8) : 1)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 4) {
+                    Text(r.agent ?? "unknown").font(.system(size: 10, weight: .heavy, design: .rounded))
+                        .lineLimit(1).fixedSize()
+                    Text("· " + r.caller).font(.system(size: 9, weight: .medium, design: .rounded))
+                        .foregroundColor(.white.opacity(0.6)).lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 2)
+                    badge(r)
+                }
+                if let sn = r.snippet, !sn.isEmpty {
+                    Text("“\(sn)”").font(.system(size: 9, weight: .regular, design: .rounded)).italic()
+                        .foregroundColor(.white.opacity(0.8)).lineLimit(1).truncationMode(.tail)
+                }
+                if !details(r).isEmpty {
+                    Text(details(r)).font(.system(size: 8.5, weight: .semibold, design: .rounded)).monospacedDigit()
+                        .foregroundColor(.white.opacity(0.5)).lineLimit(1)
+                }
+            }
+        }
+        .padding(.horizontal, 7).padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 9).fill(.white.opacity(r.running ? 0.12 : 0.06)))
+        .overlay(RoundedRectangle(cornerRadius: 9).stroke(r.running ? green.opacity(0.35) : .clear, lineWidth: 1))
+        .help(helpText(r))
+    }
+
+    @ViewBuilder private func badge(_ r: LLMRequest) -> some View {
+        let now = Date().timeIntervalSince1970
+        switch r.state ?? "" {
+        case "sending", "waiting":
+            label("⏳ reading \(ttftText(max(0, now - r.started)))", orange)
+        case "answering":
+            label("✍️ answering \(ttftText(max(0, now - r.started)))", green).opacity(0.7 + 0.3 * sin(time * 6))
+        case "blocked": label("⛔ blocked", .red)
+        case "cancelled": label("✋ stopped · \(agoText(r.started))", .white.opacity(0.5))
+        case "error": label("⚠️ error \(r.status.map(String.init) ?? "")", orange)
+        default: label(agoText(r.started), .white.opacity(0.5))
+        }
+    }
+
+    private func label(_ text: String, _ color: Color) -> some View {
+        Text(text).font(.system(size: 8.5, weight: .heavy, design: .rounded)).monospacedDigit()
+            .foregroundColor(color).lineLimit(1).fixedSize()
+    }
+
+    private func details(_ r: LLMRequest) -> String {
+        var parts: [String] = []
+        if let m = r.model, !m.isEmpty { parts.append(m) }
+        if let p = r.readText { parts.append("📖 \(p) read") }
+        if let t = r.ttft { parts.append("⏱ \(ttftText(t))") }
+        if let o = r.wroteText { parts.append("✍️ \(o)") }
+        if let s = r.seconds, !r.running { parts.append("\(ttftText(s)) total") }
+        return parts.isEmpty ? (r.path ?? "") : parts.joined(separator: " · ")
+    }
+
+    private func helpText(_ r: LLMRequest) -> String {
+        var lines = ["\(r.agent ?? "unknown") · \(r.caller)"]
+        if let ip = r.ip { lines.append("From \(ip)\(r.local == true ? " (this Mac)" : "")") }
+        lines.append("Started \(clockText(r.started))" + (r.path.map { " · \($0)" } ?? ""))
+        if let m = r.model { lines.append("Model: \(m)") }
+        if let p = r.prompt_tokens { lines.append("Read \(Int(p)) tokens" + (r.ttft.map { ", first token after \(ttftText($0))" } ?? "")) }
+        if let o = r.output_tokens { lines.append("Wrote \(Int(o)) tokens" + (r.seconds.map { " · \(ttftText($0)) in all" } ?? "")) }
+        if let sn = r.snippet { lines.append("“\(sn)”") }
+        if r.state == "blocked" { lines.append("Refused: not on the allow list, or a missing API key (Settings).") }
+        return lines.joined(separator: "\n")
+    }
+}
+
 /// Live chip power and how much energy each token takes.
 struct PowerCard: View {
     let power: Snapshot.Power?
@@ -2036,21 +2321,88 @@ struct ProcessRow: View {
 struct ExplainCard: View {
     let p: Snapshot.Proc
 
+    private let gold = Color(red: 1, green: 0.85, blue: 0.5)
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text("🗣 WHAT'S HAPPENING").font(.system(size: 8.5, weight: .black, design: .rounded))
-                .foregroundColor(.white.opacity(0.6))
-            Text(p.explain ?? "")
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .fixedSize(horizontal: false, vertical: true)
-            Text(p.label).font(.system(size: 8.5, weight: .medium, design: .rounded))
-                .foregroundColor(.white.opacity(0.45)).lineLimit(1).truncationMode(.middle)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Text("🗣 WHAT'S HAPPENING").font(.system(size: 8.5, weight: .black, design: .rounded))
+                    .foregroundColor(.white.opacity(0.6))
+                Spacer(minLength: 4)
+                Text(p.label).font(.system(size: 8.5, weight: .medium, design: .rounded))
+                    .foregroundColor(.white.opacity(0.4)).lineLimit(1).truncationMode(.middle)
+            }
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                if let icon = p.explain_icon { Text(icon).font(.system(size: 12)) }
+                Text(p.explain ?? "")
+                    .font(.system(size: 12, weight: .heavy, design: .rounded))
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            }
+            if let facts = p.explain_facts, !facts.isEmpty {
+                FlowLayout(spacing: 4) {
+                    ForEach(Array(facts.enumerated()), id: \.offset) { i, f in
+                        Text(f)
+                            .font(.system(size: 9.5, weight: .bold, design: .rounded)).monospacedDigit()
+                            .foregroundColor(i == 0 ? gold : .white.opacity(0.85))
+                            .lineLimit(1)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(i == 0 ? gold.opacity(0.16) : .white.opacity(0.09)))
+                    }
+                }
+            }
+            if let q = p.explain_quote, !q.isEmpty {
+                Text("“\(q)”").font(.system(size: 9.5, weight: .regular, design: .rounded)).italic()
+                    .foregroundColor(.white.opacity(0.7)).lineLimit(2)
+            }
         }
         .padding(.horizontal, 8).padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.06)))
-        .help((p.command ?? p.name) + "\n\nExplained by a model running on your Mac, from the script's own description, "
-              + "the files it has open, its log and the programs it started.")
+        .help((p.command ?? p.name) + (p.explain_icon != nil
+              ? "\n\nFrom GPU Buddy's request log: who is asking your LLM server right now."
+              : "\n\nSummed up by a model running on your Mac, from the script's own description, "
+                + "the files it has open, its log and the programs it started."))
+    }
+}
+
+/// Lays its children out left to right, wrapping onto new lines (for fact chips).
+struct FlowLayout: Layout {
+    var spacing: Double = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let rows = arrange(subviews, width: proposal.width ?? .infinity)
+        return CGSize(width: proposal.width ?? rows.map(\.width).max() ?? 0,
+                      height: rows.map(\.height).reduce(0, +) + spacing * Double(max(0, rows.count - 1)))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for row in arrange(subviews, width: bounds.width) {
+            var x = bounds.minX
+            for i in row.items {
+                let size = subviews[i].sizeThatFits(.unspecified)
+                subviews[i].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(width: min(size.width, bounds.width), height: size.height))
+                x += min(size.width, bounds.width) + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+
+    private struct Row { var items: [Int] = []; var width = 0.0; var height = 0.0 }
+
+    private func arrange(_ subviews: Subviews, width: Double) -> [Row] {
+        var rows = [Row()]
+        for i in subviews.indices {
+            let size = subviews[i].sizeThatFits(.unspecified)
+            let w = min(size.width, width)
+            if !rows[rows.count - 1].items.isEmpty && rows[rows.count - 1].width + spacing + w > width { rows.append(Row()) }
+            var r = rows[rows.count - 1]
+            r.width += (r.items.isEmpty ? 0 : spacing) + w
+            r.height = max(r.height, size.height)
+            r.items.append(i)
+            rows[rows.count - 1] = r
+        }
+        return rows.filter { !$0.items.isEmpty }
     }
 }
 
@@ -2423,6 +2775,7 @@ struct ContentView: View {
     @ObservedObject var characters: Characters
     var anim = Anim()
     @State private var searchQuery = ""
+    @AppStorage("tempFahrenheit") private var tempFahrenheit = false
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !store.visible)) { tl in
@@ -2483,7 +2836,8 @@ struct ContentView: View {
     // Full window: Chippy, stats, processes, hype and the 24h timeline.
     private func full(_ s: Snapshot?) -> some View {
         VStack(spacing: 8) {
-            SceneCanvas(anim: anim, mood: store.mood, badge: badge, character: characters.current, roomForBadges: true)
+            SceneCanvas(anim: anim, mood: store.mood, badge: badge, character: characters.current, roomForBadges: true,
+                        frameTime: anim.time)
                 .frame(height: sceneHeight)
                 .clipped()
                 .overlay(WindowDragArea())
@@ -2499,7 +2853,7 @@ struct ContentView: View {
                 .overlay(alignment: .topLeading) {
                     // GPU temperature and time to first token, as little friends (below the window buttons on the Mac).
                     if store.online, store.scrubTime == nil {
-                        VStack(alignment: .leading, spacing: 4) {
+                        VStack(alignment: .leading, spacing: 4 * badgeScale) {
                             if let c = s?.power?.gpu_temp {
                                 ThermoBuddy(celsius: c, time: anim.time)
                             }
@@ -2507,7 +2861,7 @@ struct ContentView: View {
                                 StopwatchBuddy(tokens: tk, time: anim.time)
                             }
                         }
-                        .scaleEffect(0.8, anchor: .topLeading)  // small, so they stay clear of the character
+                        .fixedSize(horizontal: true, vertical: false)  // both badges take the wider one's width
                         #if os(macOS)
                         .padding(.top, 30)
                         #else
@@ -2520,41 +2874,51 @@ struct ContentView: View {
             VStack(spacing: 8) {
                 HostBar(fleet: fleet)
 
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(store.online ? "\(s?.gpu.utilization_percent ?? 0)%" : "--")
-                        .font(.system(size: 34, weight: .heavy, design: .rounded))
-                        .monospacedDigit().lineLimit(1).fixedSize()
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(moodLabel[store.mood] ?? "")
-                            .font(.system(size: 11, weight: .black, design: .rounded))
-                            .foregroundColor(moodColor)
-                        Text(store.scrubTime.map { "⏪ \(agoText($0))" }
-                             ?? s.map { snap in
-                                 let chip = "\(snap.gpu.model.replacingOccurrences(of: "Apple ", with: "")) · \(snap.gpu.cores) cores"
-                                 return fleet.stores.count > 1 ? "\(snap.host?.name ?? store.host.title) · \(chip)" : chip
-                             }
-                             ?? "waiting for gpud")
-                            .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                            .foregroundColor(.white.opacity(0.6))
-                            .lineLimit(1).minimumScaleFactor(0.8)
+                FoldSection(fleet: fleet, id: "gpu", title: "GPU",
+                            summary: store.online ? "\(s?.gpu.utilization_percent ?? 0)% · \(moodLabel[store.mood] ?? "")" : "--") {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(store.online ? "\(s?.gpu.utilization_percent ?? 0)%" : "--")
+                            .font(.system(size: 34, weight: .heavy, design: .rounded))
+                            .monospacedDigit().lineLimit(1).fixedSize()
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(moodLabel[store.mood] ?? "")
+                                .font(.system(size: 11, weight: .black, design: .rounded))
+                                .foregroundColor(moodColor)
+                            Text(store.scrubTime.map { "⏪ \(agoText($0))" }
+                                 ?? s.map { snap in
+                                     let chip = "\(snap.gpu.model.replacingOccurrences(of: "Apple ", with: "")) · \(snap.gpu.cores) cores"
+                                     return fleet.stores.count > 1 ? "\(snap.host?.name ?? store.host.title) · \(chip)" : chip
+                                 }
+                                 ?? "waiting for gpud")
+                                .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                                .foregroundColor(.white.opacity(0.6))
+                                .lineLimit(1).minimumScaleFactor(0.8)
+                        }
+                        Spacer(minLength: 4)
+                        Sparkline(values: store.history).frame(width: 56, height: 26)
                     }
-                    Spacer(minLength: 4)
-                    Sparkline(values: store.history).frame(width: 56, height: 26)
+                    CoreGrid(anim: anim, cores: s?.gpu.cores ?? 16).frame(height: 17)
                 }
 
-                CoreGrid(anim: anim, cores: s?.gpu.cores ?? 16).frame(height: 17)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack {
-                        Text("MEMORY").font(.system(size: 9.5, weight: .black, design: .rounded)).foregroundColor(.white.opacity(0.6))
-                        Spacer()
-                        Text(memText(s)).font(.system(size: 10.5, weight: .bold, design: .rounded)).monospacedDigit()
-                    }
+                FoldSection(fleet: fleet, id: "memory", title: "MEMORY", summary: memText(s), showSummaryWhenOpen: true) {
                     MemoryTank(anim: anim).frame(height: 13)
                 }
 
-                TokenCard(tokens: store.online ? s?.tokens : nil, time: anim.time) { fleet.onOpenLedger?() }
-                PowerCard(power: store.online ? s?.power : nil)
+                FoldSection(fleet: fleet, id: "tokens", title: "TOKENS", summary: tokenSummary(s)) {
+                    TokenCard(tokens: store.online ? s?.tokens : nil, time: anim.time) { fleet.onOpenLedger?() }
+                }
+                if store.online, let lr = s?.llm_requests, lr.on || !lr.active.isEmpty {
+                    FoldSection(fleet: fleet, id: "requests", title: "WHO'S ASKING", summary: requestsSummary(lr)) {
+                        RequestsCard(requests: lr, time: anim.time,
+                                     onOpenLog: store.host.isLocal ? { NotificationCenter.default.post(name: .openRequestLog, object: nil) } : nil)
+                    }
+                }
+                FoldSection(fleet: fleet, id: "power", title: "POWER", summary: powerSummary(s)) {
+                    PowerCard(power: store.online ? s?.power : nil)
+                }
+
+                FoldSection(fleet: fleet, id: "processes", title: "PROCESSES",
+                            summary: topProcesses(s, 1).first.map { "\($0.is_ai ? "🤖 " : "")\($0.label)" } ?? (store.online ? "nothing running" : "--")) {
                 if let p = topProcesses(s, 5).first(where: { !($0.explain ?? "").isEmpty }) {
                     ExplainCard(p: p)
                 }
@@ -2572,16 +2936,22 @@ struct ContentView: View {
                     #endif
                     ForEach(topProcesses(s, 3, filter: searchQuery)) { ProcessRow(p: $0) }
                 }
-                .frame(height: 84, alignment: .top)
+                .frame(minHeight: 84, alignment: .top)  // grows when rows take two lines, instead of running into the next section
+                }
 
+                FoldSection(fleet: fleet, id: "cheer", title: "\(characters.currentName.uppercased()) SAYS") {
                 Text(hype(store, tick: Int(anim.time / 5)))
                     .font(.system(size: 11, weight: .bold, design: .rounded))
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity, minHeight: 30)
                     .padding(.horizontal, 6)
                     .background(RoundedRectangle(cornerRadius: 12).fill(moodColor.opacity(0.14)))
+                }
+                .padding(.top, 4)
 
-                TimelineBar(store: store)
+                FoldSection(fleet: fleet, id: "timeline", title: "TIMELINE · 24H") {
+                    TimelineBar(store: store)
+                }
             }
             .padding(.horizontal, 14)
             .padding(.bottom, 12)
@@ -2598,7 +2968,7 @@ struct ContentView: View {
     // Compact strip: mini Chippy + the essentials.
     private func compact(_ s: Snapshot?) -> some View {
         HStack(spacing: 10) {
-            SceneCanvas(anim: anim, mood: store.mood, character: characters.current)
+            SceneCanvas(anim: anim, mood: store.mood, character: characters.current, frameTime: anim.time)
                 .frame(width: 92, height: 78)
                 .clipShape(RoundedRectangle(cornerRadius: 14))
                 .overlay(WindowDragArea())
@@ -2621,8 +2991,7 @@ struct ContentView: View {
                     .foregroundColor(.white.opacity(0.6))
                     .lineLimit(1).minimumScaleFactor(0.75)
                 if let tk = store.online ? s?.tokens : nil {
-                    Text("✍️\(shortCount(tk.generated_24h)) 📖\(shortCount(tk.prompt_24h))\(tk.speed_tok_s > 0 ? " ⚡\(Int(tk.speed_tok_s))/s" : " tokens")"
-                         + ((tk.ttft_s ?? tk.ttft_avg_s).map { " ⏱\(ttftText($0))" } ?? ""))
+                    Text("✍️\(shortCount(tk.generated_24h)) 📖\(shortCount(tk.prompt_24h))\(tk.speed_tok_s > 0 ? " ⚡\(Int(tk.speed_tok_s))/s" : " tokens")")
                         .font(.system(size: 9, weight: .semibold, design: .rounded)).monospacedDigit()
                         .foregroundColor(Color(red: 1, green: 0.85, blue: 0.5))
                         .lineLimit(1)
@@ -2633,10 +3002,40 @@ struct ContentView: View {
                     .font(.system(size: 9.5, weight: .semibold, design: .rounded))
                     .lineLimit(1).truncationMode(.middle)
                     .help(topProcesses(s, 1).first?.command ?? "")
+                // Little thermometer and stopwatch chips: GPU temperature and time to first token.
+                // The row always keeps its height, so the window doesn't jump when they appear.
+                HStack(spacing: 5) {
+                    if store.online, let c = s?.power?.gpu_temp {
+                        ThermoBuddy(celsius: c, time: anim.time, mini: true)
+                    }
+                    if store.online, let tk = s?.tokens, tk.ttft_s ?? tk.ttft_avg_s != nil {
+                        StopwatchBuddy(tokens: tk, time: anim.time, mini: true)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .frame(height: 20)
             }
         }
         .padding(8)
         .frame(width: 250)
+    }
+
+    private func requestsSummary(_ lr: Snapshot.LLMRequests) -> String {
+        if let a = lr.active.first {
+            return "\(lr.active.count) now · \(a.icon ?? "") \(a.agent ?? "") · \(a.caller)"
+        }
+        if let r = lr.recent.first { return "last: \(r.icon ?? "") \(r.agent ?? "") · \(agoText(r.started))" }
+        return "no requests yet"
+    }
+
+    private func tokenSummary(_ s: Snapshot?) -> String {
+        guard store.online, let tk = s?.tokens else { return "--" }
+        return "✍️\(shortCount(tk.generated_24h)) 📖\(shortCount(tk.prompt_24h))" + (tk.speed_tok_s > 0 ? " ⚡\(Int(tk.speed_tok_s))/s" : "")
+    }
+
+    private func powerSummary(_ s: Snapshot?) -> String {
+        guard store.online, let p = s?.power, p.available else { return "--" }
+        return [p.gpu_w.map { "GPU \(Int($0)) W" }, p.system_w.map { "Mac \(Int($0)) W" }].compactMap { $0 }.joined(separator: " · ")
     }
 
     private func memText(_ s: Snapshot?) -> String {
@@ -2653,6 +3052,46 @@ struct ContentView: View {
             ($0.activity ?? "").localizedCaseInsensitiveContains(filter)
         }
         return Array(searched.prefix(n))
+    }
+}
+
+/// A section of the full view that folds away: a small header with an arrow, and a one-line summary when folded.
+struct FoldSection<Content: View>: View {
+    @ObservedObject var fleet: Fleet
+    let id: String
+    let title: String
+    var summary: String? = nil
+    var showSummaryWhenOpen = false
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        let open = !fleet.collapsed.contains(id)
+        VStack(alignment: .leading, spacing: 4) {
+            Button { fleet.toggleSection(id) } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 7, weight: .black))
+                        .rotationEffect(.degrees(open ? 90 : 0))
+                        .frame(width: 8)
+                    Text(title)
+                        .font(.system(size: 9.5, weight: .black, design: .rounded))
+                        .foregroundColor(.white.opacity(0.6))
+                        .lineLimit(1).fixedSize()
+                    Spacer(minLength: 4)
+                    if let summary, !open || showSummaryWhenOpen {
+                        Text(summary)
+                            .font(.system(size: 10, weight: .bold, design: .rounded)).monospacedDigit()
+                            .foregroundColor(.white.opacity(open ? 1 : 0.8))
+                            .lineLimit(1).truncationMode(.tail)
+                    }
+                }
+                .foregroundColor(.white.opacity(0.45))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(open ? "Fold away \(title.lowercased())" : "Show \(title.lowercased())")
+            if open { content() }
+        }
     }
 }
 
@@ -2699,7 +3138,7 @@ struct AppIcon: View {
 #if os(macOS)
 struct AboutView: View {
     let daemonVersion: String?
-    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.12.0"
+    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.13.0"
 
     var body: some View {
         VStack(spacing: 16) {
@@ -2788,6 +3227,10 @@ struct SettingsView: View {
                 }
             }
 
+            section("Who's Using My LLM") {
+                RequestLogSettings()
+            }
+
             section("Appearance") {
                 Text("Character preferences and animations are handled within the app.").font(.system(size: 11, weight: .regular, design: .rounded)).foregroundColor(.white.opacity(0.6))
             }
@@ -2814,6 +3257,370 @@ struct SettingsView: View {
                 if !unit.isEmpty { Text(unit).font(.system(size: 9, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.4)) }
             }
         }
+    }
+}
+
+extension Notification.Name {
+    /// Opens the Request Log window (posted by the WHO'S ASKING card and Settings).
+    static let openRequestLog = Notification.Name("GPUBuddyOpenRequestLog")
+}
+
+// MARK: - LLM request log window
+
+@MainActor
+final class RequestLogModel: ObservableObject {
+    struct Page: Decodable { let on: Bool; let active: [LLMRequest]; let entries: [LLMRequest] }
+    @Published var page: Page?
+    @Published var problem: String?
+
+    func load() async {
+        guard let url = URL(string: "http://127.0.0.1:8765/api/v1/llm-proxy/log?limit=5000"),
+              let (data, resp) = try? await URLSession.shared.data(from: url) else {
+            problem = "gpud isn't running."
+            return
+        }
+        guard (resp as? HTTPURLResponse)?.statusCode == 200, let p = try? JSONDecoder().decode(Page.self, from: data) else {
+            problem = "This gpud is too old for the request log."
+            return
+        }
+        page = p
+        problem = nil
+    }
+}
+
+#if os(macOS)
+/// Every request to the local LLM server that the log kept: live, searchable, sortable.
+struct RequestLogView: View {
+    @StateObject private var model = RequestLogModel()
+    @State private var query = ""
+    @State private var agent = "All"
+    @State private var sort = [KeyPathComparator(\LLMRequest.started, order: .reverse)]
+    @State private var selection: LLMRequest.ID?
+
+    private var all: [LLMRequest] { (model.page?.active ?? []) + (model.page?.entries ?? []) }
+
+    private var rows: [LLMRequest] {
+        let q = query.lowercased()
+        return all.filter { r in
+            (agent == "All" || r.agent == agent)
+            && (q.isEmpty || [r.agent, r.caller, r.model, r.snippet, r.ip, r.state].compactMap { $0?.lowercased() }.contains { $0.contains(q) })
+        }.sorted(using: sort)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Text("📜 Request Log").font(.system(size: 17, weight: .heavy, design: .rounded))
+                Spacer()
+                Picker("", selection: $agent) {
+                    Text("All agents").tag("All")
+                    ForEach(Array(Set(all.compactMap(\.agent))).sorted(), id: \.self) { Text($0).tag($0) }
+                }
+                .frame(width: 150)
+                TextField("Search who, model, words…", text: $query)
+                    .textFieldStyle(.roundedBorder).frame(width: 220)
+            }
+            .padding(.top, titleBarInset)
+            .background(WindowDragArea())
+
+            totals
+
+            if let p = model.problem {
+                Text("⚠️ " + p).foregroundColor(.orange)
+            } else if model.page?.on == false && all.isEmpty {
+                Text("The request log is off. Turn it on in Settings → Who's Using My LLM.")
+                    .foregroundColor(.white.opacity(0.6))
+            }
+
+            Table(rows, selection: $selection, sortOrder: $sort) {
+                TableColumn("When", value: \.started) { r in
+                    Text(timeText(r.started)).monospacedDigit()
+                }.width(min: 70, ideal: 92)
+                TableColumn("Agent", value: \.agentKey) { r in
+                    Text("\(r.icon ?? "") \(r.agent ?? "?")").fontWeight(.semibold)
+                }.width(min: 80, ideal: 110)
+                TableColumn("From", value: \.caller) { r in
+                    Text(r.caller).help(r.ip ?? "")
+                }.width(min: 80, ideal: 150)
+                TableColumn("Model", value: \.modelKey) { r in Text(r.model ?? "") }.width(min: 60, ideal: 110)
+                TableColumn("Read", value: \.readKey) { r in
+                    Text(r.readText ?? "").monospacedDigit()
+                }.width(min: 40, ideal: 52)
+                TableColumn("1st token", value: \.ttftKey) { r in
+                    Text(r.ttft.map(ttftText) ?? "").monospacedDigit()
+                }.width(min: 50, ideal: 62)
+                TableColumn("Wrote", value: \.outputKey) { r in
+                    Text(r.wroteText ?? "").monospacedDigit()
+                }.width(min: 40, ideal: 50)
+                TableColumn("Total", value: \.secondsKey) { r in
+                    Text(r.seconds.map(ttftText) ?? (r.running ? "…" : "")).monospacedDigit()
+                }.width(min: 40, ideal: 56)
+                TableColumn("Status", value: \.stateKey) { r in
+                    Text(stateText(r)).foregroundColor(stateColor(r))
+                }.width(min: 60, ideal: 84)
+                TableColumn("What") { r in
+                    Text(r.snippet ?? "").foregroundColor(.white.opacity(0.75)).help(r.snippet ?? "")
+                }.width(min: 80, ideal: 260)
+            }
+            .font(.system(size: 11, design: .rounded))
+
+            HStack {
+                Text("Kept on this Mac for 7 days. Snippets appear only when “Keep the first 100 characters” is on in Settings.")
+                    .font(.system(size: 10, design: .rounded)).foregroundColor(.white.opacity(0.45))
+                Spacer()
+                Button("Show the file in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: NSHomeDirectory()
+                        + "/Library/Application Support/GPUBuddy/llm-requests.jsonl")])
+                }
+            }
+        }
+        .padding(.horizontal, 16).padding(.bottom, 12)
+        .task {
+            while !Task.isCancelled {
+                await model.load()
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+    }
+
+    /// Requests, tokens and the busiest agent for the rows shown.
+    private var totals: some View {
+        let r = rows
+        let read = r.compactMap { $0.prompt_tokens ?? $0.est_tokens }.reduce(0, +)
+        let wrote = r.compactMap(\.output_tokens).reduce(0, +)
+        let ttfts = r.compactMap(\.ttft)
+        let byAgent = Dictionary(grouping: r, by: { $0.agent ?? "?" }).mapValues(\.count).sorted { $0.value > $1.value }
+        let blocked = r.filter { $0.state == "blocked" }.count
+        return HStack(spacing: 8) {
+            chip("\(r.count) requests")
+            chip("📖 \(shortCount(read)) read")
+            chip("✍️ \(shortCount(wrote)) written")
+            if !ttfts.isEmpty { chip("⏱ avg 1st token \(ttftText(ttfts.reduce(0, +) / Double(ttfts.count)))") }
+            if let top = byAgent.first { chip("most: \(top.key) (\(top.value))") }
+            if blocked > 0 { chip("⛔ \(blocked) blocked").foregroundColor(.red) }
+        }
+    }
+
+    private func chip(_ t: String) -> some View {
+        Text(t).font(.system(size: 10.5, weight: .bold, design: .rounded)).monospacedDigit()
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(Capsule().fill(.white.opacity(0.08)))
+    }
+
+    private func timeText(_ t: Double) -> String {
+        let d = Date(timeIntervalSince1970: t)
+        let f = DateFormatter()
+        f.dateFormat = Calendar.current.isDateInToday(d) ? "HH:mm:ss" : "MMM d HH:mm"
+        return f.string(from: d)
+    }
+
+    private func stateText(_ r: LLMRequest) -> String {
+        switch r.state ?? "" {
+        case "sending", "waiting": return "⏳ reading"
+        case "answering": return "✍️ answering"
+        case "done": return "✓ done"
+        case "cancelled": return "✋ stopped"
+        case "blocked": return "⛔ blocked"
+        default: return "⚠️ \(r.status.map(String.init) ?? "error")"
+        }
+    }
+
+    private func stateColor(_ r: LLMRequest) -> Color {
+        switch r.state ?? "" {
+        case "sending", "waiting", "answering": return .green
+        case "blocked", "error": return .red
+        case "cancelled": return .white.opacity(0.5)
+        default: return .white.opacity(0.8)
+        }
+    }
+}
+#endif
+
+/// Sort keys for the log table (Table sorts on non-optional values).
+extension LLMRequest {
+    var agentKey: String { agent ?? "" }
+    var modelKey: String { model ?? "" }
+    var promptKey: Double { prompt_tokens ?? -1 }
+    var ttftKey: Double { ttft ?? -1 }
+    var outputKey: Double { output_tokens ?? -1 }
+    var secondsKey: Double { seconds ?? .infinity }
+    var stateKey: String { state ?? "" }
+}
+
+// MARK: - LLM request log settings
+
+/// gpud's LLM request log: on/off, allow list, API key and snippets. Talks to this Mac's gpud only.
+@MainActor
+final class RequestLog: ObservableObject {
+    struct Status: Decodable {
+        struct Moved: Decodable { let file: String; let backup: String }
+        let enabled: Bool
+        let state: String
+        let message: String?
+        let listen_port: Int
+        let upstream_port: Int
+        let allow: [String]
+        let key_required: Bool
+        let api_key: String?
+        let snippets: Bool
+        let retention_days: Int
+        let log_file: String
+        let addresses: [String]?
+        let moved: Moved?
+    }
+    @Published var status: Status?
+    @Published var problem: String?
+    @Published var allowText = ""
+    @Published var sending = false
+    private let url = URL(string: "http://127.0.0.1:8765/api/v1/llm-proxy")!
+
+    func refresh() async {
+        guard let (data, resp) = try? await URLSession.shared.data(from: url) else {
+            problem = "gpud isn't running, so the request log can't be changed."
+            return
+        }
+        guard (resp as? HTTPURLResponse)?.statusCode == 200, let st = try? JSONDecoder().decode(Status.self, from: data) else {
+            problem = "This gpud is too old for the request log. Update GPU Buddy's background service."
+            return
+        }
+        if status?.allow != st.allow { allowText = st.allow.joined(separator: ", ") }
+        status = st
+        problem = nil
+    }
+
+    func send(_ change: [String: Any]) async {
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: change)
+        req.timeoutInterval = 120  // turning off waits for the LLM server to restart
+        sending = true
+        defer { sending = false }
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            if (resp as? HTTPURLResponse)?.statusCode != 200 {
+                problem = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String ?? "That didn't work."
+                return
+            }
+        } catch {
+            problem = "gpud didn't answer: \(error.localizedDescription)"
+            return
+        }
+        await refresh()
+    }
+}
+
+struct RequestLogSettings: View {
+    @StateObject private var log = RequestLog()
+    @State private var copied = false
+
+    private let small = Font.system(size: 9.5, weight: .regular, design: .rounded)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Log who uses my local LLM server", isOn: Binding(
+                get: { log.status?.enabled ?? false },
+                set: { on in Task { await log.send(["enabled": on]) } }))
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                #if os(macOS)
+                .toggleStyle(.checkbox)
+                #endif
+                .disabled(log.status == nil || log.sending || log.status?.state == "starting")
+
+            statusLine
+
+            if let st = log.status, st.enabled || st.state == "on" {
+                #if os(macOS)
+                Toggle("Keep the first 100 characters of each request", isOn: Binding(
+                    get: { st.snippets }, set: { v in Task { await log.send(["snippets": v]) } }))
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .toggleStyle(.checkbox)
+                    .help("Shows what each request is about. It stays on this Mac, is never sent to your other Macs, and is deleted after \(st.retention_days) days.")
+                #endif
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Other devices allowed").font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                    HStack(spacing: 6) {
+                        TextField("e.g. 10.0.2.126", text: $log.allowText)
+                            .textFieldStyle(.roundedBorder).font(.system(size: 10.5, design: .monospaced))
+                            .onSubmit { saveAllow() }
+                        Button("Save") { saveAllow() }
+                            .disabled(log.allowText == st.allow.joined(separator: ", "))
+                    }
+                    Text("This Mac is always allowed. Separate addresses with commas; 10.0.2.0/24 allows a whole network, * allows everyone.")
+                        .font(small).foregroundColor(.white.opacity(0.5)).fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    if st.key_required, let key = st.api_key {
+                        HStack(spacing: 6) {
+                            Text("API key").font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                            Text(String(key.prefix(6)) + "••••••" + String(key.suffix(4)))
+                                .font(.system(size: 10.5, design: .monospaced)).foregroundColor(.white.opacity(0.7))
+                            #if os(macOS)
+                            Button(copied ? "Copied" : "Copy") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(key, forType: .string)
+                                copied = true
+                            }
+                            #endif
+                            Button("Remove") { Task { await log.send(["remove_api_key": true]) } }
+                        }
+                        Text("Other devices must send this key (in Cline: the API Key field). This Mac doesn't need it.")
+                            .font(small).foregroundColor(.white.opacity(0.5)).fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Button("Require an API key from other devices") { Task { await log.send(["new_api_key": true]) } }
+                    }
+                }
+
+                Button("Open the Request Log") { NotificationCenter.default.post(name: .openRequestLog, object: nil) }
+            } else {
+                Text("GPU Buddy sits in front of your LLM server on port 8080 and notes which app or device asks, the agent (Claude Code, Cline…), sizes and timings. Your server moves to port 8081 for this Mac only (GPU Buddy edits its start script and keeps a backup), so apps keep their settings. Turning this off puts everything back.")
+                    .font(small).foregroundColor(.white.opacity(0.55)).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .task {
+            while !Task.isCancelled {
+                await log.refresh()
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+        }
+    }
+
+    @ViewBuilder private var statusLine: some View {
+        if let p = log.problem {
+            Text("⚠️ " + p).font(small).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+        } else if let st = log.status {
+            switch st.state {
+            case "starting", "stopping":
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(st.message ?? (st.state == "starting" ? "Starting…" : "Putting your LLM server back on port \(st.listen_port)…"))
+                        .font(small).foregroundColor(.white.opacity(0.7))
+                }
+            case "on":
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("✅ On. Your LLM server runs on port \(st.upstream_port) (this Mac only); apps keep using port \(st.listen_port).")
+                    if let ip = st.addresses?.first {
+                        Text("Other devices: http://\(ip):\(st.listen_port)/v1").textSelection(.enabled)
+                    }
+                    if let m = st.message { Text(m).foregroundColor(.orange) }
+                }
+                .font(small).foregroundColor(.white.opacity(0.7)).fixedSize(horizontal: false, vertical: true)
+            case "error":
+                Text("⚠️ " + (st.message ?? "Couldn't start.")).font(small).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            default:
+                if let m = st.message {
+                    Text(m).font(small).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func saveAllow() {
+        let list = log.allowText.split(whereSeparator: { $0 == "," || $0 == " " }).map(String.init).filter { !$0.isEmpty }
+        Task { await log.send(["allow": list]) }
     }
 }
 
