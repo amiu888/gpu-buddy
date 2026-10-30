@@ -17,6 +17,7 @@ serves them over a local HTTP API:
   GET /api/v1/power        -> chip power right now (GPU, CPU, ANE, DRAM) and energy per token
   GET /api/v1/explain      -> what each busy script is doing, in plain English (?pid=N for one,
                               with the evidence used; &refresh=1 to ask again)
+  GET /api/v1/llm-proxy/models -> models on this Mac, on the NAS and on ollama.com, and downloads (see modellib.py)
   GET /api/v1/llm-proxy/log -> the request log itself, newest first (?limit=2000; this Mac only)
   GET /api/v1/llm-proxy    -> the LLM request log: settings, requests running now and the latest ones
                               (this Mac only; POST JSON to change: enabled, snippets, allow, new_api_key,
@@ -65,8 +66,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import llmproxy
+import modellib
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 RETENTION_SECONDS = 24 * 3600
 STATE_DIR = os.path.expanduser("~/Library/Application Support/GPUBuddy")
 DEFAULT_DB = os.path.join(STATE_DIR, "history.db")
@@ -77,7 +79,7 @@ POWER_KEYS = ("gpu", "cpu", "ane", "dram", "other")
 AI_HINTS = (
     "ollama", "llama", "mlx", "lm studio", "lmstudio", "python", "comfy", "diffusion",
     "whisper", "torch", "vllm", "gpt4all", "kobold", "jan", "draw things", "exo",
-    "mlc", "msty", "invoke", "fooocus", "claude", "chatgpt",
+    "mlc", "msty", "invoke", "fooocus", "claude", "chatgpt", "kapitsa",
 )
 
 INTERPRETERS = ("python", "node", "ruby", "java", "perl", "bun", "deno", "julia")
@@ -186,7 +188,8 @@ def top_process(procs):
     return process_label(p), p["gpu_percent"], int(bool(p.get("is_ai")))
 
 
-LLM_HINTS = ("mlx", "llama", "ollama", "vllm", "lm studio", "lmstudio", "lms ", "exo", "kobold", "gpt4all", "jan", "sglang", "tabby")
+LLM_HINTS = ("mlx", "llama", "ollama", "vllm", "lm studio", "lmstudio", "lms ", "exo", "kobold", "gpt4all", "jan", "sglang",
+             "tabby", "kapitsa")
 PROM_PROMPT = ("llamacpp:prompt_tokens_total", "vllm:prompt_tokens_total", "sglang:prompt_tokens_total")
 PROM_GEN = ("llamacpp:tokens_predicted_total", "vllm:generation_tokens_total", "sglang:generation_tokens_total")
 PROM_RUNNING = ("llamacpp:requests_processing", "vllm:num_requests_running", "sglang:num_running_reqs")
@@ -233,6 +236,7 @@ class TokenWatcher:
         self._pending_by = {}  # (server, model) -> [generated, prompt]
         self._last_discover = 0.0
         self.extra = [u.strip().rstrip("/") for u in os.environ.get("GPUD_TOKEN_URLS", "").split(",") if u.strip()]
+        self.proxy = None  # the request log (llmproxy.LLMProxy): counts tokens for servers that don't (Kapitsa)
 
     def _listening(self):
         """base url -> (pid, process name) for every LLM-looking process with a listening TCP port."""
@@ -245,6 +249,8 @@ class TokenWatcher:
         for line in ps.splitlines():
             pid_s, _, args = line.strip().partition(" ")
             low = args.lower()
+            if "ollama.app/contents/macos/ollama" in low or "/.ollama/models/blobs/" in low:
+                continue  # the Ollama app's window (it forwards to `ollama serve`) and its per-model helpers
             if pid_s.isdigit() and any(h in low for h in LLM_HINTS) and "gpud.py" not in low:
                 pids[int(pid_s)] = describe_server(args)
         if not pids:
@@ -283,6 +289,10 @@ class TokenWatcher:
                 return "ollama"
         except Exception:
             pass
+        # No counters of its own, but every request passes through the request log on its way here.
+        p = self.proxy
+        if p and p.serves(int(base.rsplit(":", 1)[-1])):
+            return "proxy"
         return None
 
     def _read(self, src):
@@ -326,8 +336,24 @@ class TokenWatcher:
             ttft = {"last": None, "avg": pick(PROM_TTFT_SUM) / n, "at": 0, "model": "", "prompt": None,
                     "cache": None, "n": int(n)} if n else None
             return pick(PROM_PROMPT), pick(PROM_GEN), pick(PROM_RUNNING), None, "", ttft
+        if src["kind"] == "proxy":
+            if not self.proxy or self.proxy.state != "on":
+                return None
+            port = int(src["url"].rsplit(":", 1)[-1])
+            prompt, gen, in_flight, speed, model, ttft = self.proxy.counters(port)
+            model = self.proxy.served_model(port) or model  # Kapitsa answers any name: say what it really runs
+            return prompt, gen, in_flight, speed, model_name(model), ttft
         if src["kind"] == "ollama":
-            return None  # Ollama exposes no token counters
+            # Ollama publishes no token counters; requests that go through GPU Buddy's router are counted there.
+            port = int(src["url"].rsplit(":", 1)[-1])
+            try:  # the models it has in memory right now
+                src["loaded"] = [m.get("name") for m in json.loads(http_get(src["url"] + "/api/ps")).get("models") or []]
+            except Exception:
+                src["loaded"] = []
+            if self.proxy and self.proxy.serves(port):
+                prompt, gen, in_flight, speed, model, ttft = self.proxy.counters(port)
+                return prompt, gen, in_flight, speed, model_name(model), ttft
+            return None
         return None
 
     @staticmethod
@@ -394,15 +420,32 @@ class TokenWatcher:
                 src.update(prompt=prompt, gen=gen, in_flight=in_flight, model=model, ttft=ttft,
                            gen_rate=d_gen / dt, prompt_rate=d_prompt / dt, last_ts=now,
                            speed=(speed if speed is not None else d_gen / dt) if (in_flight or d_gen) else 0.0)
+                if src["speed"] > 0:  # remembered until the next request, so the speed stays on screen
+                    src["last_speed"], src["last_speed_at"] = src["speed"], now
 
     def take(self):
         """Tokens counted since the last call, per (server, model), plus a public view of each source."""
+        last = {}
+        if self.proxy:  # the last finished request's own average is the best "last speed" for routed servers
+            with self.lock:
+                urls = [s["url"] for s in self.sources.values() if s["kind"] in ("proxy", "ollama")]
+            for u in urls:
+                fin = self.proxy.last_finished(int(u.rsplit(":", 1)[-1]))
+                if fin:
+                    last[u] = fin
         with self.lock:
             gen, prompt, by = self._pending_gen, self._pending_prompt, self._pending_by
             self._pending_gen = self._pending_prompt = 0
             self._pending_by = {}
+            for s in self.sources.values():
+                fin = last.get(s["url"])
+                if fin and not s["in_flight"] and fin[1] >= s.get("last_speed_at", 0) - 5:
+                    s["last_speed"], s["last_speed_at"] = fin[0], fin[1]
             view = [{"name": s["name"], "url": s["url"], "kind": s["kind"], "pid": s["pid"], "model": s["model"],
                      "in_flight": s["in_flight"], "tok_s": round(s["speed"], 1),
+                     "loaded": s.get("loaded"),
+                     "last_tok_s": round(s["last_speed"], 1) if s.get("last_speed") else None,
+                     "last_tok_at": s.get("last_speed_at"),
                      "generated_total": s["gen"], "prompt_total": s["prompt"],
                      "ttft_s": round(s["ttft"]["last"], 3) if s["ttft"] and s["ttft"]["last"] is not None else None,
                      "ttft_avg_s": round(s["ttft"]["avg"], 3) if s["ttft"] else None,
@@ -635,7 +678,7 @@ class Explainer:
         if self.url:
             return self.url, self._model_id(self.url, "prometheus")
         with self.tokens.lock:
-            sources = [s for s in self.tokens.sources.values() if s["kind"] in ("mlx-json", "prometheus")]
+            sources = [s for s in self.tokens.sources.values() if s["kind"] in ("mlx-json", "prometheus", "proxy")]
         sources.sort(key=lambda s: "vl" in (s.get("model") or "").lower())  # text models first
         for s in sources:
             model = self._model_id(s["url"], s["kind"])
@@ -975,6 +1018,14 @@ class HistoryDB:
                 (int(since // 3600) * 3600,)).fetchone()
         return gpu, ai, gen
 
+    def token_by_server(self, since):
+        """(server, model) -> [generated, prompt] since `since` (whole hours)."""
+        with self.lock:
+            rows = self.conn.execute("SELECT server, model, COALESCE(SUM(generated), 0), COALESCE(SUM(prompt), 0) "
+                                     "FROM token_usage WHERE hour >= ? GROUP BY server, model",
+                                     (int(since // 3600 * 3600),)).fetchall()
+        return {(r[0], r[1]): [r[2], r[3]] for r in rows}
+
     def token_totals(self, since):
         with self.lock:
             return self.conn.execute(
@@ -1023,6 +1074,8 @@ class GPUSampler:
         self._e24 = list(db.energy_totals(time.time() - RETENTION_SECONDS))
         self._tok24 = list(db.token_totals(time.time() - RETENTION_SECONDS))
         self._tok24_refreshed = time.time()
+        self._srv24 = db.token_by_server(time.time() - RETENTION_SECONDS)
+        self._srv24_extra = {}
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
         self.latest = None
@@ -1110,6 +1163,40 @@ class GPUSampler:
         return info
 
     # ---- sampling ---------------------------------------------------------------
+    def _llms(self, sources):
+        """The LLMs loaded right now, one row each: Kapitsa's model while it runs, and every model Ollama holds in
+        memory (a row goes when Ollama unloads it). Each with its speed now, its last speed (kept until the next
+        request) and its tokens read and written in the last 24 hours."""
+        def used(server, model=None):
+            g = p = 0
+            for src in (self._srv24, self._srv24_extra):
+                for (sv, m), (gg, pp) in src.items():
+                    if sv == server and (model is None or m == model):
+                        g, p = g + gg, p + pp
+            return g, p
+
+        proxy = getattr(self, "proxy", None)
+        rows = []
+        for s in sources:
+            port = int(s["url"].rsplit(":", 1)[-1])
+            label = {"ollama": "Ollama", "kapitsa": "Kapitsa"}.get(s["name"].lower(), s["name"])
+            if s["kind"] == "ollama":
+                for m in s.get("loaded") or []:
+                    mine = s["model"] == m
+                    last = proxy.last_finished(port, m) if proxy else None
+                    g, p = used(s["name"], m)
+                    rows.append({"server": label, "model": m, "in_flight": s["in_flight"] if mine else 0,
+                                 "tok_s": s["tok_s"] if mine else 0,
+                                 "last_tok_s": last[0] if last else (s["last_tok_s"] if mine else None),
+                                 "last_tok_at": last[1] if last else (s["last_tok_at"] if mine else None),
+                                 "generated_24h": g, "prompt_24h": p})
+            else:
+                g, p = used(s["name"])  # one model per server: count every name apps used for it
+                rows.append({"server": label, "model": s["model"], "in_flight": s["in_flight"], "tok_s": s["tok_s"],
+                             "last_tok_s": s["last_tok_s"], "last_tok_at": s["last_tok_at"],
+                             "generated_24h": g, "prompt_24h": p})
+        return sorted(rows, key=lambda r: (-(r["in_flight"] or 0), -(r["last_tok_at"] or 0)))
+
     def sample(self):
         now = time.time()
         stats = self._accelerator().get("PerformanceStatistics", {})
@@ -1145,9 +1232,17 @@ class GPUSampler:
         if now - self._tok24_refreshed > 30:  # re-sync the rolling 24h totals with the database
             self._tok24 = list(self.db.token_totals(now - RETENTION_SECONDS))
             self._e24 = list(self.db.energy_totals(now - RETENTION_SECONDS))
+            # Per LLM server: the database (saved every so often) plus what was counted since it was read.
+            self._srv24 = self.db.token_by_server(now - RETENTION_SECONDS)
+            self._srv24_extra = {}
             self._tok24_refreshed = now
         self._tok24[0] += gen_d
         self._tok24[1] += prompt_d
+        for key, (g, pr) in by_model.items():
+            e = self._srv24_extra.setdefault(key, [0, 0])
+            e[0] += g
+            e[1] += pr
+        llms = self._llms(sources)
         if self.explainer:
             for p in active:
                 e = self.explainer.get(p["pid"])
@@ -1155,9 +1250,10 @@ class GPUSampler:
                     p["explain"] = e["text"]
                     p["explain_facts"] = e.get("facts") or []
         speed = {s["pid"]: s for s in sources if s["pid"]}
-        doing = self.proxy.now_doing() if getattr(self, "proxy", None) else None
+        proxy = getattr(self, "proxy", None)
         for p in active:
             if p["pid"] in speed:
+                doing = proxy.now_doing(int(speed[p["pid"]]["url"].rsplit(":", 1)[-1])) if proxy else None
                 p["tok_s"] = speed[p["pid"]]["tok_s"]
                 p["is_ai"] = True
                 if doing:  # the LLM server: say who it's working for, from the request log
@@ -1257,6 +1353,7 @@ class GPUSampler:
                 "in_flight": sum(s["in_flight"] or 0 for s in sources),
                 **latest_ttft(sources),
                 "sources": sources,
+                "llms": llms,
             },
             "power": power,
             "llm_requests": self.proxy.summary() if getattr(self, "proxy", None) else None,
@@ -1791,6 +1888,10 @@ def make_handler(sampler, identity=None, remote=False):
                 return self._stream()
             if url.path == "/api/v1/llm-proxy" and not self._private() and self._loopback_host():
                 return self._json(dict(sampler.proxy.status(), **sampler.proxy.summary(50)), cors=False)
+            if url.path == "/api/v1/llm-proxy/models" and not self._private() and self._loopback_host():
+                d = sampler.models.status(refresh=q.get("refresh") == ["1"])
+                d["usage"] = modellib.usage(sampler.proxy.history(5000), sampler.proxy.summary(0)["active"])
+                return self._json(d, cors=False)
             if url.path == "/api/v1/llm-proxy/log" and not self._private() and self._loopback_host():
                 try:
                     limit = max(1, min(int(q.get("limit", ["2000"])[0]), 20000))
@@ -1807,7 +1908,8 @@ def make_handler(sampler, identity=None, remote=False):
         def do_POST(self):
             # Settings changes: only from apps on this Mac. JSON only, which a web page can't send to another
             # site without a preflight this server never answers.
-            if self._private() or urlparse(self.path).path != "/api/v1/llm-proxy" or not self._loopback_host():
+            path = urlparse(self.path).path
+            if self._private() or path not in ("/api/v1/llm-proxy", "/api/v1/llm-proxy/models") or not self._loopback_host():
                 return self._json({"error": "not found"}, 404, cors=False)
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 return self._json({"error": "send JSON"}, 415, cors=False)
@@ -1816,6 +1918,8 @@ def make_handler(sampler, identity=None, remote=False):
                 change = json.loads(self.rfile.read(n)) if 0 < n < 65536 else None
                 if not isinstance(change, dict):
                     raise ValueError("send a JSON object")
+                if path.endswith("/models"):
+                    return self._json(sampler.models.change(change), cors=False)
                 return self._json(sampler.proxy.configure(change), cors=False)
             except (ValueError, TypeError) as e:
                 return self._json({"error": str(e)}, 400, cors=False)
@@ -1891,7 +1995,10 @@ def main():
     sampler = GPUSampler(args.interval, HistoryDB(args.db), tokens, power)
     sampler.remote_port = args.remote_port
     sampler.explainer = Explainer(sampler, tokens)
-    sampler.proxy = llmproxy.LLMProxy()
+    if args.remote_port:
+        llmproxy.RESERVED_PORTS.add(args.remote_port)
+    sampler.proxy = tokens.proxy = llmproxy.LLMProxy()
+    sampler.models = modellib.ModelLibrary()
     threading.Thread(target=sampler.explainer.loop, daemon=True).start()
     threading.Thread(target=sampler.loop, daemon=True).start()
 

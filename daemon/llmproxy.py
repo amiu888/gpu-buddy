@@ -9,9 +9,16 @@ request it notes:
   what   - optional: the first 100 characters of the last user message ("snippets", off by default)
   sizes  - model, prompt and answer tokens, time to first token, total time
 
+Routing (the LLM Router):
+  - GPU Buddy finds the LLM servers on this Mac (Kapitsa, Ollama, LM Studio, llama.cpp, MLX, vLLM…) and the models each
+    one has, every 15 seconds.
+  - Entry ports: each port GPU Buddy listens on (8080 by default) sends its requests either to one chosen server, or
+    to whichever server has the model the request names ("auto"), else to its default server.
+
 Security:
-  - Only this Mac and the addresses in the allow list can use the server. Optionally, other devices must also send
-    an API key (Authorization: Bearer <key>, or x-api-key).
+  - This Mac can always use the servers. Other devices need to be on the allow list, or to send a client key
+    (Authorization: Bearer <key>, or x-api-key) made for that entry port. With "require_key", the allow list alone
+    isn't enough. Keys are stored on this Mac only (readable by you only) and are not passed on to the servers.
   - The log stays on this Mac (~/Library/Application Support/GPUBuddy/llm-requests.jsonl, readable by you only) and
     entries older than the retention period (7 days) are deleted. Request headers (keys, passwords) are never stored,
     and neither are whole prompts or answers.
@@ -42,7 +49,32 @@ BACKUPS = os.path.join(STATE_DIR, "llm-proxy-backups")
 LAUNCH_AGENTS = os.path.expanduser("~/Library/LaunchAgents")
 
 DEFAULTS = {"enabled": False, "listen_port": 8080, "upstream_port": 8081, "allow": [], "api_key": "",
-            "snippets": False, "retention_days": 7, "moved": None}
+            "snippets": False, "retention_days": 7, "moved": None,
+            "routes": None,          # entry ports, see _default_routes
+            "keys": [],              # client keys: {"id", "name", "key", "routes": ["*"] or route ids, "created", "last_used"}
+            "require_key": False,    # other devices need a key even when on the allow list
+            "server_names": {},      # server id -> the name the user gave it
+            "manual_servers": []}    # servers GPU Buddy can't find by itself: {"host", "port", "name"}
+
+# Ports LLM servers often use, checked even when the program's name gives nothing away.
+KNOWN_PORTS = (8000, 8001, 8080, 8081, 8082, 8083, 1234, 11434, 11435, 5000, 5001, 1337, 4891, 30000, 52415, 8888, 9000)
+# (words in the process or the /v1/models answer, kind, name, icon), first match wins.
+KINDS = [
+    (("kapitsa", '"nace"'), "kapitsa", "Kapitsa", "⚡"),
+    (("ollama", '"library"'), "ollama", "Ollama", "🦙"),
+    (("lm studio", "lmstudio", "lms ", "organization_owner"), "lmstudio", "LM Studio", "🧪"),
+    (("mlx",), "mlx", "MLX", "🍎"),
+    (("llama-server", "llama.cpp", "llamacpp", "llama_cpp"), "llamacpp", "llama.cpp", "🦙"),
+    (("vllm",), "vllm", "vLLM", "🚀"),
+    (("sglang",), "sglang", "SGLang", "🧵"),
+    (("exo",), "exo", "exo", "🕸️"),
+    (("kobold",), "kobold", "KoboldCpp", "🐲"),
+    (("gpt4all",), "gpt4all", "GPT4All", "🌍"),
+    (("jan",), "jan", "Jan", "👋"),
+    (("tabby",), "tabby", "Tabby", "🐱"),
+]
+LLM_WORDS = tuple(w for words, *_ in KINDS for w in words if not w.startswith('"') and w != "organization_owner")
+RESERVED_PORTS = {8765}  # gpud's own API; gpud adds its remote port
 
 # Headers that belong to one connection, not to the request, so they aren't passed on.
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "trailers",
@@ -241,16 +273,33 @@ class LLMProxy:
                 self.cfg.update(json.load(f))
         except (OSError, ValueError):
             pass
-        self.server = None
+        self._migrate()
+        self.listeners = {}  # route id -> {"srv", "port", "network"}
+        self.route_state = {}  # route id -> (state, message)
+        self.servers = {}  # server id ("127.0.0.1:8081") -> what discovery found
         self.state, self.message = "off", None
         self.active = {}  # id -> request in progress
         self.recent = collections.deque(maxlen=200)
+        self.totals = {}  # server port -> {"prompt", "gen", "gen_seen"}: tokens since gpud started, for counters()
         self.local_ips = _Lookup.local_addresses()
         self._busy = threading.Lock()  # one turn on / off at a time
         self._load_recent()
+        threading.Thread(target=self._discover_loop, daemon=True).start()
         if self.cfg["enabled"]:
             threading.Thread(target=self._start, daemon=True).start()
         threading.Thread(target=self._housekeeping, daemon=True).start()
+
+    def _migrate(self):
+        """Settings from before the router: one entry port, and one shared API key."""
+        c = self.cfg
+        if not c.get("routes"):
+            c["routes"] = [{"id": "main", "name": "Main", "port": c["listen_port"], "target": "auto",
+                            "default": f"127.0.0.1:{c['upstream_port']}", "network": True}]
+        if c.get("api_key"):
+            c["keys"] = list(c.get("keys") or []) + [{"id": secrets.token_hex(4), "name": "Shared key", "key": c["api_key"],
+                                                      "routes": ["*"], "created": _now(), "last_used": None}]
+            c["require_key"] = True
+            c["api_key"] = ""
 
     # ---- settings
 
@@ -264,34 +313,93 @@ class LLMProxy:
     def status(self, local=True):
         with self.lock:
             c = self.cfg
-            out = {"enabled": c["enabled"], "state": self.state, "message": self.message,
-                   "listen_port": c["listen_port"], "upstream_port": c["upstream_port"], "allow": c["allow"],
-                   "key_required": bool(c["api_key"]), "snippets": c["snippets"], "retention_days": c["retention_days"],
-                   "moved": c["moved"] and {"file": c["moved"]["file"], "backup": c["moved"]["backup"]},
-                   "log_file": LOG,
-                   "addresses": _addresses(self.local_ips)}
-            if local:
-                out["api_key"] = c["api_key"]
-            return out
+            addrs = _addresses(self.local_ips)
+            routes = []
+            for r in c["routes"]:
+                st, msg = self.route_state.get(r["id"], ("off", None))
+                hosts = (addrs if r["network"] else []) + ["127.0.0.1"]
+                routes.append(dict(r, state=st, message=msg, urls=[f"http://{h}:{r['port']}/v1" for h in hosts]))
+            keys = [{"id": k["id"], "name": k["name"], "routes": k["routes"], "created": k.get("created"),
+                     "last_used": k.get("last_used"), "hint": k["key"][:5] + "…" + k["key"][-4:],
+                     **({"key": k["key"]} if local else {})} for k in c["keys"]]
+            main = c["routes"][0] if c["routes"] else {"port": c["listen_port"]}
+            return {"enabled": c["enabled"], "state": self.state, "message": self.message,
+                    "listen_port": main["port"], "upstream_port": c["upstream_port"], "allow": c["allow"],
+                    "key_required": c["require_key"], "require_key": c["require_key"], "snippets": c["snippets"],
+                    "retention_days": c["retention_days"],
+                    "moved": c["moved"] and {"file": c["moved"]["file"], "backup": c["moved"]["backup"]},
+                    "log_file": LOG, "addresses": addrs, "routes": routes, "keys": keys,
+                    "servers": sorted(self.servers.values(), key=lambda s: (not s["up"], s["port"])),
+                    "clients": self._clients()}
 
     def configure(self, change):
         """Apply settings from the app. Turning on or off can take a few seconds (the LLM server restarts)."""
+        routes_changed = False
         with self.lock:
+            c = self.cfg
             if "snippets" in change:
-                self.cfg["snippets"] = bool(change["snippets"])
+                c["snippets"] = bool(change["snippets"])
             if "allow" in change:
                 allow = [a.strip() for a in change["allow"] if isinstance(a, str) and a.strip()]
                 bad = [a for a in allow if not re.fullmatch(r"[0-9a-fA-F:.]+(/\d{1,3})?|\*", a)]
                 if bad:
                     raise ValueError(f"not an IP address: {', '.join(bad)}")
-                self.cfg["allow"] = allow
-            if change.get("new_api_key"):
-                self.cfg["api_key"] = "gb-" + secrets.token_urlsafe(24)
-            if change.get("remove_api_key"):
-                self.cfg["api_key"] = ""
+                c["allow"] = allow
+            if "require_key" in change:
+                c["require_key"] = bool(change["require_key"])
             if "retention_days" in change:
-                self.cfg["retention_days"] = max(1, min(365, int(change["retention_days"])))
+                c["retention_days"] = max(1, min(365, int(change["retention_days"])))
+            if "routes" in change:
+                c["routes"] = self._valid_routes(change["routes"])
+                ids = {r["id"] for r in c["routes"]}
+                for k in c["keys"]:  # a key for a deleted entry port loses it
+                    if k["routes"] != ["*"]:
+                        k["routes"] = [r for r in k["routes"] if r in ids]
+                routes_changed = True
+            if "new_key" in change:
+                nk = change["new_key"] or {}
+                name = str(nk.get("name") or "").strip()[:40]
+                if not name:
+                    raise ValueError("give the key a name, like “Cline on MacBook”")
+                if any(k["name"].lower() == name.lower() for k in c["keys"]):
+                    raise ValueError(f"there's already a key called “{name}”")
+                c["keys"].append({"id": secrets.token_hex(4), "name": name, "key": "gb-" + secrets.token_urlsafe(24),
+                                  "routes": self._valid_key_routes(nk.get("routes")), "created": _now(), "last_used": None})
+            if "key_routes" in change:
+                k = self._key(change["key_routes"].get("id"))
+                k["routes"] = self._valid_key_routes(change["key_routes"].get("routes"))
+            if "rename_key" in change:
+                k = self._key(change["rename_key"].get("id"))
+                name = str(change["rename_key"].get("name") or "").strip()[:40]
+                if name:
+                    k["name"] = name
+            if "remove_key" in change:
+                c["keys"] = [k for k in c["keys"] if k["id"] != change["remove_key"]]
+            if "server_name" in change:
+                sid, name = str(change["server_name"].get("id")), str(change["server_name"].get("name") or "").strip()[:40]
+                if name:
+                    c["server_names"][sid] = name
+                else:
+                    c["server_names"].pop(sid, None)
+                if sid in self.servers:
+                    self.servers[sid]["name"] = name or self.servers[sid]["kind_name"]
+            if "add_server" in change:
+                a = change["add_server"]
+                port = int(a.get("port") or 0)
+                host = str(a.get("host") or "127.0.0.1").strip()
+                if not 1 <= port <= 65535 or not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", host):
+                    raise ValueError("give a host and a port, like 127.0.0.1 and 8000")
+                c["manual_servers"] = [m for m in c["manual_servers"] if (m["host"], m["port"]) != (host, port)] + \
+                    [{"host": host, "port": port, "name": str(a.get("name") or "").strip()[:40]}]
+            if "remove_server" in change:
+                sid = str(change["remove_server"])
+                c["manual_servers"] = [m for m in c["manual_servers"] if f"{m['host']}:{m['port']}" != sid]
+                self.servers.pop(sid, None)
             self._save()
+        if "add_server" in change:
+            threading.Thread(target=self.discover, daemon=True).start()
+        if routes_changed and self.state == "on":
+            threading.Thread(target=self.apply_routes, daemon=True).start()
         if "enabled" in change and bool(change["enabled"]) != self.cfg["enabled"]:
             if change["enabled"]:  # can take a while (the server restarts and loads), so the app polls status
                 with self.lock:
@@ -300,6 +408,61 @@ class LLMProxy:
             else:  # waits until the server is back on its port, so uninstalling can rely on it
                 self._stop()
         return self.status()
+
+    def _key(self, kid):
+        for k in self.cfg["keys"]:
+            if k["id"] == kid:
+                return k
+        raise ValueError("that key doesn't exist any more")
+
+    def _valid_key_routes(self, routes):
+        if not routes or routes == ["*"] or routes == "*":
+            return ["*"]
+        ids = {r["id"] for r in self.cfg["routes"]}
+        out = [r for r in routes if r in ids]
+        if not out:
+            raise ValueError("pick at least one entry port for this key")
+        return out
+
+    def _valid_routes(self, routes):
+        """Check the entry ports the app sends; raises ValueError with a sentence the app can show."""
+        if not isinstance(routes, list) or not routes:
+            raise ValueError("keep at least one entry port")
+        out, ports = [], set()
+        server_ports = {s["port"] for s in self.servers.values() if s["host"] in ("127.0.0.1", "localhost")}
+        mine = {r["port"] for r in self.cfg["routes"]}
+        for r in routes:
+            try:
+                port = int(r.get("port"))
+            except (TypeError, ValueError):
+                raise ValueError("each entry port needs a port number")
+            name = str(r.get("name") or "").strip()[:40] or f"Port {port}"
+            if not 1024 <= port <= 65535:
+                raise ValueError(f"{name}: use a port from 1024 to 65535")
+            if port in ports:
+                raise ValueError(f"port {port} is used twice")
+            if port in RESERVED_PORTS:
+                raise ValueError(f"port {port} is GPU Buddy's own")
+            if port in server_ports and port not in mine:
+                raise ValueError(f"port {port} is an LLM server's own port; pick a free one")
+            target = str(r.get("target") or "auto")
+            default = r.get("default") or None
+            for sid in [target] if target != "auto" else []:
+                if not re.fullmatch(r"[A-Za-z0-9.:-]+:\d+", sid):
+                    raise ValueError(f"{name}: pick a server to send to")
+            ports.add(port)
+            rid = str(r.get("id") or "") or secrets.token_hex(3)
+            if not re.fullmatch(r"[a-z0-9-]{1,20}", rid):
+                rid = secrets.token_hex(3)
+            out.append({"id": rid, "name": name, "port": port, "target": target, "default": default,
+                        "network": bool(r.get("network", True))})
+        return out
+
+    def _route(self, rid):
+        for r in self.cfg["routes"]:
+            if r["id"] == rid:
+                return r
+        return None
 
     # ---- turning on and off
 
@@ -310,8 +473,9 @@ class LLMProxy:
                 c["enabled"] = True
                 self._save()
                 self.state, self.message = "starting", None
-            port, up = c["listen_port"], c["upstream_port"]
-            if _port_open(port) and not c["moved"]:
+            # The first entry port may be where an LLM server already listens (8080): that server moves to 8081.
+            port, up = c["routes"][0]["port"], c["upstream_port"]
+            if _port_open(port) and not c["moved"] and not self.listeners:
                 job = find_server_job(port)
                 if job is None:
                     return self._fail(f"Port {port} is in use by a program GPU Buddy doesn't know how to move. Start your "
@@ -324,22 +488,48 @@ class LLMProxy:
                 with self.lock:
                     c["moved"] = moved
                     self._save()
-            for _ in range(240):  # the old server lets go of the port as it restarts
+            self.apply_routes(wait=120)
+            with self.lock:
+                if not self.listeners:
+                    bad = [m for st, m in self.route_state.values() if m]
+                    return self._fail(bad[0] if bad else "No entry port could start.")
+                self.state = "on"
+                self.message = None if _wait_port(up, 1) or not c["moved"] else f"Waiting for the LLM server on port {up}…"
+            threading.Thread(target=self.discover, daemon=True).start()
+
+    def apply_routes(self, wait=0):
+        """Start, move or stop entry ports so they match the settings. wait: seconds to wait for a busy port (only
+        right after moving the LLM server off it)."""
+        with self.lock:
+            routes = {r["id"]: r for r in self.cfg["routes"]}
+        for rid, l in list(self.listeners.items()):
+            r = routes.get(rid)
+            if not r or r["port"] != l["port"] or r["network"] != l["network"]:
+                l["srv"].shutdown()
+                l["srv"].server_close()
+                del self.listeners[rid]
+                self.route_state.pop(rid, None)
+        for rid, r in routes.items():
+            if rid in self.listeners:
+                continue
+            end = _now() + wait
+            while True:
                 try:
-                    srv = _DualStack(("::", port), self._handler())
+                    srv = (_DualStack(("::", r["port"]), self._handler(rid)) if r["network"]
+                           else _LocalOnly(("127.0.0.1", r["port"]), self._handler(rid)))
                     break
                 except OSError:
-                    if not c["enabled"]:
-                        return
+                    if _now() >= end or not self.cfg["enabled"]:
+                        srv = None
+                        break
                     time.sleep(0.5)
-            else:
-                return self._fail(f"Port {port} stayed busy, so the request log couldn't start.")
-            self.server = srv
+            if srv is None:
+                self.route_state[rid] = ("error", f"Port {r['port']} is in use by another program.")
+                continue
             threading.Thread(target=srv.serve_forever, daemon=True).start()
-            with self.lock:
-                self.state = "on"
-                self.message = None if _wait_port(up, 1) else f"Waiting for the LLM server on port {up}…"
-            print(f"gpud: LLM request log on :{port} -> 127.0.0.1:{up}", flush=True)
+            self.listeners[rid] = {"srv": srv, "port": r["port"], "network": r["network"]}
+            self.route_state[rid] = ("on", None)
+            print(f"gpud: LLM router: {r['name']} on {'*' if r['network'] else '127.0.0.1'}:{r['port']}", flush=True)
 
     def _fail(self, msg):
         with self.lock:
@@ -354,16 +544,17 @@ class LLMProxy:
                 self.cfg["enabled"] = False
                 self._save()
                 self.state, self.message = "stopping", None
-            if self.server:
-                self.server.shutdown()
-                self.server.server_close()
-                self.server = None
+            for rid, l in list(self.listeners.items()):
+                l["srv"].shutdown()
+                l["srv"].server_close()
+            self.listeners.clear()
+            self.route_state.clear()
             msg = None
             if self.cfg["moved"]:
                 try:
                     msg = restore_server(self.cfg["moved"])
                 except Exception as e:
-                    msg = f"Couldn't put the LLM server back on port {self.cfg['listen_port']}: {e}"
+                    msg = f"Couldn't put the LLM server back on port {self.cfg['moved'].get('old_port')}: {e}"
                 with self.lock:
                     self.cfg["moved"] = None
                     self._save()
@@ -428,12 +619,14 @@ class LLMProxy:
                 pass
         return out
 
-    def now_doing(self):
-        """What the LLM server is doing, for the "what's happening" box: a short headline and a few facts about the
-        oldest request running, or the one that just finished. None when it's idle (or the log is off)."""
+    def now_doing(self, port=None):
+        """What an LLM server (the one on `port`, or any) is doing, for the "what's happening" box: a short headline
+        and a few facts about the oldest request running, or the one that just finished. None when it's idle."""
+        mine = (lambda r: True) if port is None else (lambda r: self._server_port(r) == port)
         with self.lock:
-            act = sorted(self.active.values(), key=lambda r: r["started"])
-            last = self.recent[-1] if self.recent else None
+            act = sorted((r for r in self.active.values() if mine(r)), key=lambda r: r["started"])
+            done = [r for r in self.recent if mine(r)]
+            last = done[-1] if done else None
         now = _now()
         if act:
             r = act[0]
@@ -460,31 +653,197 @@ class LLMProxy:
                     "quote": last.get("snippet")}
         return None
 
+    def _server_port(self, r):
+        """The port of the server that handled a log entry (entries from before the router: the moved server's)."""
+        return r.get("server_port") or (self.cfg["upstream_port"] if r.get("status") != 403 else None)
+
+    def _clients(self):
+        """Who used the router in the last day, newest first: one row per key, or per device and agent."""
+        cutoff, rows = _now() - 86400, {}
+        with self.lock:
+            entries = [r for r in self.recent if (r.get("started") or 0) >= cutoff]
+        for r in entries:
+            k = ("key", r["client"]) if r.get("client") else ("dev", r.get("ip"), r.get("agent"))
+            row = rows.setdefault(k, {"name": r.get("client") or r.get("agent") or "?", "key": bool(r.get("client")),
+                                      "who": _caller(r), "ip": r.get("ip"), "local": bool(r.get("local")),
+                                      "agent": r.get("agent"), "icon": r.get("icon"), "count": 0})
+            row.update(last=r.get("started"), route=r.get("route"), server=r.get("server"),
+                       blocked=r.get("state") == "blocked", who=_caller(r) or row["who"])
+            row["count"] += 1
+        return sorted(rows.values(), key=lambda x: -(x.get("last") or 0))[:16]
+
+    def served_model(self, port):
+        """The one model a server like Kapitsa runs (it answers any model name), or None."""
+        with self.lock:
+            for sv in self.servers.values():
+                if sv["port"] == port and sv.get("any_model") and sv.get("models"):
+                    return sv["models"][0]
+        return None
+
+    def last_finished(self, port, model=None):
+        """(tok/s, finished at, model) of the newest finished request on this server that wrote something, or None.
+        Speed counts only the writing, after the first token when that's known."""
+        with self.lock:
+            done = [r for r in self.recent if self._server_port(r) == port and (r.get("status") or 0) < 400
+                    and (r.get("output_tokens") or 0) >= 5 and r.get("seconds")
+                    and (model is None or r.get("model") == model)]
+        for r in reversed(done):
+            gen = r["seconds"] - (r.get("ttft") or 0) if r.get("ttft") and r["seconds"] - r["ttft"] > 0.2 else r["seconds"]
+            if gen > 0.05:
+                return round(r["output_tokens"] / gen, 1), r["started"] + r["seconds"], r.get("model") or ""
+        return None
+
     def summary(self, recent=8):
-        """For the app's live view: requests running now and the last few."""
+        """For the app's live view: requests running now (with the tokens written so far) and the last few."""
         with self.lock:
             return {"on": self.state == "on",
-                    "active": [{k: v for k, v in r.items() if not k.startswith("_")} for r in self.active.values()],
+                    "active": [dict({k: v for k, v in r.items() if not k.startswith("_")}, live_tokens=r.get("_pieces"))
+                               for r in self.active.values()],
                     "recent": list(self.recent)[-recent:][::-1]}
+
+    # ---- finding the LLM servers on this Mac
+
+    def _discover_loop(self):
+        while True:
+            try:
+                self.discover()
+            except Exception as e:
+                print(f"gpud: LLM router: looking for servers failed: {e}", flush=True)
+            time.sleep(15)
+
+    def discover(self):
+        """Find the LLM servers on this Mac: programs that look like one, ports they often use, and servers the user
+        added. A server counts when it answers /v1/models. Servers that stop answering stay listed (as down) while
+        an entry port points at them, or for a day."""
+        listening = _listeners()
+        own = {l["port"] for l in self.listeners.values()} | RESERVED_PORTS
+        cands = {}
+        for port, (pid, args, addrs) in listening.items():
+            if port in own or pid == os.getpid() or "gpud.py" in args:  # GPU Buddy itself
+                continue
+            if "/.ollama/models/blobs/" in args or "Ollama.app/Contents/Resources/" in args and "llama-server" in args:
+                continue  # Ollama's own helper for a loaded model (random port): reached through Ollama, not directly
+                continue
+            low = args.lower()
+            if port in KNOWN_PORTS or any(w in low for w in LLM_WORDS):
+                cands[f"127.0.0.1:{port}"] = ("127.0.0.1", port, pid, args, addrs)
+        for m in self.cfg["manual_servers"]:
+            sid = f"{m['host']}:{m['port']}"
+            pid, args, addrs = listening.get(m["port"], (None, "", [])) if m["host"] in ("127.0.0.1", "localhost") \
+                else (None, "", [])
+            cands[sid] = (m["host"], m["port"], pid, args, addrs)
+        found = {}
+        threads = [threading.Thread(target=lambda sid=sid, c=c: found.__setitem__(sid, _probe_server(*c)), daemon=True)
+                   for sid, c in cands.items()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(25)
+        now = _now()
+        manual = {f"{m['host']}:{m['port']}": m for m in self.cfg["manual_servers"]}
+        targets = {r["target"] for r in self.cfg["routes"]} | {r.get("default") for r in self.cfg["routes"]}
+        with self.lock:
+            for sid, rec in found.items():
+                if not rec:
+                    continue
+                rec["id"] = sid
+                rec["manual"] = sid in manual
+                rec["name"] = self.cfg["server_names"].get(sid) or (manual.get(sid) or {}).get("name") or rec["kind_name"]
+                rec["seen"] = now
+                self.servers[sid] = rec
+            for sid, s in list(self.servers.items()):
+                if not found.get(sid):
+                    s["up"] = False
+                    if sid not in targets and sid not in manual and now - s.get("seen", 0) > 86400:
+                        del self.servers[sid]
+            for sid in targets | set(manual):  # what entry ports point at, even if it never answered
+                if sid and sid != "auto" and sid not in self.servers and re.fullmatch(r".+:\d+", sid):
+                    host, port = sid.rsplit(":", 1)
+                    self.servers[sid] = {"id": sid, "host": host, "port": int(port), "kind": "unknown",
+                                         "kind_name": "LLM server", "icon": "❔", "process": None, "pid": None,
+                                         "models": [], "any_model": False, "up": False, "network": False,
+                                         "manual": sid in manual, "seen": 0,
+                                         "name": self.cfg["server_names"].get(sid) or (manual.get(sid) or {}).get("name")
+                                         or f"Port {port}"}
 
     # ---- the proxy
 
-    def _allowed(self, ip, headers):
-        """None if this caller may use the server, else why not."""
-        if ip in self.local_ips:
+    def _client_key(self, headers, route):
+        """The client key this request carries for this entry port, or None. Keys for other ports don't count."""
+        sent = headers.get("Authorization", "")
+        sent = sent[7:].strip() if sent.startswith("Bearer ") else headers.get("x-api-key", "").strip()
+        if not sent.startswith("gb-"):
             return None
-        allow = self.cfg["allow"]
-        if "*" not in allow and not any(_ip_match(ip, a) for a in allow):
-            return f"{ip} isn't on GPU Buddy's allow list for this LLM server"
-        key = self.cfg["api_key"]
-        if key:
-            sent = headers.get("Authorization", "")
-            sent = sent[7:] if sent.startswith("Bearer ") else headers.get("x-api-key", "")
-            if not hmac.compare_digest(sent.encode(), key.encode()):
-                return "this LLM server needs GPU Buddy's API key"
+        for k in self.cfg["keys"]:
+            if hmac.compare_digest(sent.encode(), k["key"].encode()):
+                return k if k["routes"] == ["*"] or route["id"] in k["routes"] else None
         return None
 
-    def _handler(self):
+    def _allowed(self, ip, headers, route):
+        """(why not, or None; the client key's name, or None) for a caller on an entry port."""
+        key = self._client_key(headers, route)
+        if key:
+            key["last_used"] = _now()
+            return None, key["name"]
+        if ip in self.local_ips:
+            return None, None
+        if not route["network"]:
+            return "this entry port is for this Mac only", None
+        allow = self.cfg["allow"]
+        listed = "*" in allow or any(_ip_match(ip, a) for a in allow)
+        if listed and not self.cfg["require_key"]:
+            return None, None
+        if listed:
+            return "this LLM router needs a client key from GPU Buddy (put it in your app's API Key field)", None
+        return (f"{ip} isn't on GPU Buddy's allow list for this LLM server, and sent no client key for this entry "
+                f"port"), None
+
+    def _pick(self, route, model):
+        """(server, how) for a request on an entry port: its chosen server, or the one that has the model."""
+        with self.lock:
+            servers = dict(self.servers)
+        if route["target"] != "auto":
+            return servers.get(route["target"]), "fixed"
+        up = [s for s in servers.values() if s["up"]]
+        if model:
+            want = str(model)
+            short = _short_model(want)
+            for test in (lambda s: want in s["models"],
+                         lambda s: any(_short_model(m) == short for m in s["models"]),
+                         lambda s: ":" not in want and any(m == want + ":latest" for m in s["models"])):
+                hit = [s for s in up if test(s)]
+                if hit:
+                    return sorted(hit, key=lambda s: s["any_model"])[0], "model"
+        default = servers.get(route.get("default") or "")
+        if default and default["up"]:
+            return default, "default"
+        for s in sorted(up, key=lambda s: (not s["any_model"], s["port"])):
+            return s, "default"
+        return default, "default"
+
+    def models_list(self, route):
+        """/v1/models for an "auto" entry port: every model of every running server, so apps can pick from all."""
+        with self.lock:
+            servers = [s for s in self.servers.values() if s["up"]]
+        if route["target"] != "auto":
+            servers = [s for s in servers if s["id"] == route["target"]]
+        data, seen = [], set()
+        for s in sorted(servers, key=lambda s: s["port"]):
+            for m in s["models"]:
+                if m not in seen:
+                    seen.add(m)
+                    data.append({"id": m, "object": "model", "created": 0, "owned_by": s["name"]})
+        return {"object": "list", "data": data}
+
+    def _lists_models(self, route):
+        """GPU Buddy answers /v1/models itself (always a list, never null) unless the port's server is unknown or down."""
+        if route["target"] == "auto":
+            return True
+        with self.lock:
+            s = self.servers.get(route["target"])
+            return bool(s and s["up"])
+
+    def _handler(self, route_id):
         proxy = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -528,20 +887,50 @@ class LLMProxy:
                 except ValueError as e:
                     self.close_connection = True
                     return self._error(413, str(e))
+                route = proxy._route(route_id)
+                if route is None:
+                    return self._error(503, "this entry port was removed in GPU Buddy")
                 entry = None
                 if logged:
                     entry = proxy._begin(ip, port, self.path, self.headers, body)
-                why = proxy._allowed(ip, self.headers)
+                    entry["route"] = route["name"]
+                why, client = proxy._allowed(ip, self.headers, route)
                 if why:
                     if entry:
                         proxy._finish(entry, 403, state="blocked")
                     elif self.command != "OPTIONS":
                         proxy._write({"id": secrets.token_hex(4), "started": _now(), "ip": ip, "path": self.path,
                                       "agent": "Unknown device", "icon": "⛔", "who": _Lookup.device(ip) or ip, "state": "blocked",
-                                      "status": 403})
+                                      "status": 403, "route": route["name"]})
                     return self._error(403, why)
+                if entry and client:
+                    entry["client"] = client
+                path = self.path.split("?")[0].rstrip("/")
+                if self.command == "GET" and path in ("/v1/models", "/models") and proxy._lists_models(route):
+                    data = json.dumps(proxy.models_list(route)).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    return self.wfile.write(data)
+                model = None
+                if body[:1] == b"{":
+                    try:
+                        model = json.loads(body).get("model")
+                    except (ValueError, AttributeError):
+                        pass
+                server, how = proxy._pick(route, model)
+                if server is None or not server["up"]:
+                    name = server["name"] if server else "an LLM server"
+                    if entry:
+                        proxy._finish(entry, 503, state="error")
+                    return self._error(503, f"{name} isn't running, so GPU Buddy has nowhere to send this "
+                                            f"(entry port “{route['name']}”). Start it, or change the routing in "
+                                            f"GPU Buddy's LLM Router.")
+                if entry:
+                    entry.update(server=server["name"], server_port=server["port"], routed_by=how)
                 try:
-                    self._forward(body, entry)
+                    self._forward(body, entry, server, client)
                 except (BrokenPipeError, ConnectionResetError):
                     if entry:
                         proxy._finish(entry, 499, state="cancelled")
@@ -549,14 +938,16 @@ class LLMProxy:
                     if entry:
                         proxy._finish(entry, 502, state="error")
                     try:
-                        self._error(502, f"GPU Buddy couldn't reach the LLM server on port {proxy.cfg['upstream_port']}: {e}")
+                        self._error(502, f"GPU Buddy couldn't reach {server['name']} on port {server['port']}: {e}")
                     except Exception:
                         pass
 
-            def _forward(self, body, entry):
-                up = http.client.HTTPConnection("127.0.0.1", proxy.cfg["upstream_port"], timeout=900)
+            def _forward(self, body, entry, server, client):
+                up = http.client.HTTPConnection(server["host"], server["port"], timeout=900)
                 headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
-                headers["Host"] = f"127.0.0.1:{proxy.cfg['upstream_port']}"
+                if client:  # GPU Buddy's own key: the server doesn't need to see it
+                    headers = {k: v for k, v in headers.items() if k.lower() not in ("authorization", "x-api-key")}
+                headers["Host"] = f"{server['host']}:{server['port']}"
                 headers["X-Forwarded-For"] = _clean_ip(self.client_address[0])
                 if body or self.command in ("POST", "PUT", "PATCH"):
                     headers["Content-Length"] = str(len(body))
@@ -601,6 +992,7 @@ class LLMProxy:
                             lines = (partial + chunk).split(b"\n")
                             partial = lines.pop()
                             pieces += sum(1 for l in lines if l.startswith(b"data:") and FIRST_TOKEN.search(l))
+                            entry["_pieces"] = pieces
                 if entry:
                     entry["prompt_tokens"], entry["output_tokens"] = _usage(head, tail, streamed)
                     if entry["output_tokens"] is None and pieces:
@@ -650,9 +1042,48 @@ class LLMProxy:
             t.join(3)
         entry.update(status=status, state=state if status < 400 or state != "done" else "error",
                      seconds=round(_now() - entry["started"], 3))
+        entry.pop("_pieces", None)
         with self.lock:
             self.active.pop(entry["id"], None)
+            if status < 400 and entry.get("server_port"):
+                t = self.totals.setdefault(entry["server_port"], {"prompt": 0, "gen": 0, "gen_seen": 0})
+                t["prompt"] += entry.get("prompt_tokens") or 0
+                t["gen"] += entry.get("output_tokens") or 0
         self._write(entry)
+
+    def serves(self, port):
+        """Whether the router passes requests to an LLM server on this port (so counters(port) means something)."""
+        return self.state == "on" and any(s["port"] == port and s["host"] in ("127.0.0.1", "localhost")
+                                          for s in self.servers.values())
+
+    def counters(self, port=None):
+        """Token counters for an LLM server the router sends to, for servers that publish none of their own
+        (Kapitsa, Ollama): (prompt total, generated total, in flight, tok/s now, model, time to first token) as
+        TokenWatcher reads them. Generated tokens count up live from the streamed pieces, and never go down."""
+        now = _now()
+        port = port or self.cfg["upstream_port"]
+        with self.lock:
+            act = [r for r in self.active.values() if r.get("server_port") == port]
+            done = [r for r in self.recent if r.get("status") and r["status"] < 400 and self._server_port(r) == port]
+            t = self.totals.setdefault(port, {"prompt": 0, "gen": 0, "gen_seen": 0})
+            gen = t["gen"] + sum(r.get("_pieces") or 0 for r in act)
+            gen = t["gen_seen"] = max(gen, t["gen_seen"])
+            prompt = t["prompt"]
+        speeds = [r["_pieces"] / (now - r["started"] - r["ttft"]) for r in act
+                  if r.get("_pieces") and r.get("ttft") and now - r["started"] - r["ttft"] > 0.2]
+        timed = [r for r in done if r.get("ttft")]
+        model = (act[-1] if act else done[-1] if done else {}).get("model") or ""
+        ttft = None
+        if timed:
+            last = timed[-1]
+            same = [r["ttft"] for r in timed[-20:] if r.get("model") == last.get("model")]
+            ttft = {"last": last["ttft"], "avg": sum(same) / len(same), "at": last["started"] + last["ttft"],
+                    "model": last.get("model") or "", "prompt": last.get("prompt_tokens"), "cache": None,
+                    "n": len(same)}
+            waiting = [r["started"] for r in act if r.get("state") in ("sending", "waiting")]
+            if waiting:
+                ttft["pending_since"] = min(waiting)
+        return prompt, gen, len(act), sum(speeds), model, ttft
 
 
 class _DualStack(ThreadingHTTPServer):
@@ -667,6 +1098,83 @@ class _DualStack(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         pass  # clients that hang up mid-answer
+
+
+class _LocalOnly(ThreadingHTTPServer):
+    """An entry port for this Mac only."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+def _short_model(m):
+    """'/Users/me/.local/share/qwen36-moe-mlx/model' -> 'qwen36-moe-mlx'; 'mlx-community/Qwen3-8B' -> 'qwen3-8b'."""
+    parts = [p for p in str(m).split("/") if p]
+    if not parts:
+        return ""
+    return (parts[-2] if parts[-1] == "model" and len(parts) > 1 else parts[-1]).lower()
+
+
+def _listeners():
+    """port -> (pid, the program's command line, addresses it listens on) for this user's listening TCP ports."""
+    try:
+        raw = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"], capture_output=True, timeout=8).stdout.decode()
+    except Exception:
+        return {}
+    ports, pid = {}, None
+    for line in raw.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid:
+            addr, _, port = line[1:].rpartition(":")
+            if port.isdigit():
+                p = ports.setdefault(int(port), [pid, set()])
+                p[1].add(addr.strip("[]"))
+    args = {}
+    pids = {p for p, _ in ports.values()}
+    if pids:
+        try:
+            out = subprocess.run(["ps", "-o", "pid=,args=", "-p", ",".join(map(str, pids))], capture_output=True,
+                                 timeout=5).stdout.decode()
+            for line in out.splitlines():
+                pid_s, _, a = line.strip().partition(" ")
+                if pid_s.isdigit():
+                    args[int(pid_s)] = a.strip()
+        except Exception:
+            pass
+    return {port: (pid, args.get(pid, ""), sorted(addrs)) for port, (pid, addrs) in ports.items()}
+
+
+def _probe_server(host, port, pid, args, addrs):
+    """What answers /v1/models on host:port, or None if it isn't an LLM server."""
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=20)  # an Ollama on the NAS can take a while to list
+        conn.request("GET", "/v1/models", headers={"Authorization": "Bearer gpu-buddy"})
+        resp = conn.getresponse()
+        raw = resp.read(4 << 20)
+        conn.close()
+        d = json.loads(raw) if resp.status == 200 else None
+    except Exception:
+        return None
+    if not isinstance(d, dict) or not (isinstance(d.get("data"), list) or d.get("object") == "list"):
+        return None
+    rows = [m for m in d.get("data") or [] if isinstance(m, dict) and m.get("id")]  # Ollama with no models: null
+    active = [m["id"] for m in rows if m.get("active")]  # Kapitsa also lists catalog models it could download
+    models = active or [m["id"] for m in rows]
+    hay = (args + " " + raw[:4000].decode(errors="replace")).lower()
+    kind, kind_name, icon = "openai", "LLM server", "🧠"
+    for words, k, name, ic in KINDS:
+        if any(w in hay for w in words):
+            kind, kind_name, icon = k, name, ic
+            break
+    if kind == "ollama" and port != 11434:
+        kind_name = f"Ollama :{port}"
+    prog = os.path.basename(args.split()[0]) if args else None
+    return {"host": host, "port": port, "kind": kind, "kind_name": kind_name, "icon": icon, "process": prog,
+            "pid": pid, "models": models[:300], "any_model": kind == "kapitsa", "up": True,
+            "network": any(a in ("*", "0.0.0.0", "::") for a in addrs)}
 
 
 def _addresses(local_ips):

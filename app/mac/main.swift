@@ -119,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var settingsWindow: NSWindow?
     var ledgerWindow: NSWindow?
     var requestLogWindow: NSWindow?
+    var routerWindow: NSWindow?
     var macsWindow: NSWindow?
     private var port = 8765
     private var lastIcon = -2
@@ -128,8 +129,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         fleet = Fleet(localPort: port)
         fleet.onUpdate = { [weak self] s in self?.updateDockIcon(s) }
         fleet.onOpenLedger = { [weak self] in self?.openLedger() }
+        NotificationCenter.default.addObserver(forName: .openRouter, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.openRouter() }
+        }
         NotificationCenter.default.addObserver(forName: .openRequestLog, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.openRequestLog() }
+        }
+        if CommandLine.arguments.contains("--router") {  // `open "GPU Buddy.app" --args --router`
+            DispatchQueue.main.async { [weak self] in self?.openRouter() }
+        }
+        // For checking the layout: `--snapshot-router out.png` saves a picture of the router window after 6 s.
+        if let i = CommandLine.arguments.firstIndex(of: "--snapshot-router"), i + 1 < CommandLine.arguments.count {
+            let out = CommandLine.arguments[i + 1]
+            DispatchQueue.main.async { [weak self] in self?.openRouter() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                guard let v = self?.routerWindow?.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
+                v.cacheDisplay(in: v.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+            }
+        }
+        // Same for the main window: `--snapshot-main out.png`.
+        if let i = CommandLine.arguments.firstIndex(of: "--snapshot-main"), i + 1 < CommandLine.arguments.count {
+            let out = CommandLine.arguments[i + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+                guard let v = self?.window?.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
+                v.cacheDisplay(in: v.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+            }
         }
         fleet.onOpenMacs = { [weak self] in self?.openMacs() }
         fleet.onSelect = { [weak self] in self?.hostChanged() }
@@ -238,6 +264,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let requests = NSMenuItem(title: "Request Log…", action: #selector(openRequestLog), keyEquivalent: "r")
         requests.target = self
         appMenu.addItem(requests)
+        let router = NSMenuItem(title: "LLM Router…", action: #selector(openRouter), keyEquivalent: "e")
+        router.target = self
+        appMenu.addItem(router)
         appMenu.addItem(.separator())
         for (title, action, key) in [("Macs…", #selector(openMacs), "k"), ("Next Mac", #selector(nextMac), "]"),
                                      ("Previous Mac", #selector(previousMac), "["), ("Next Character", #selector(nextCharacter), "j"),
@@ -307,6 +336,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             requestLogWindow = w
         }
         requestLogWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func openRouter() {
+        if routerWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1220, height: 680),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                             backing: .buffered, defer: false)
+            w.titlebarAppearsTransparent = true
+            w.titleVisibility = .hidden
+            w.title = "LLM Router"
+            w.contentMinSize = NSSize(width: 900, height: 480)
+            w.isReleasedWhenClosed = false
+            w.backgroundColor = window.backgroundColor
+            w.appearance = NSAppearance(named: .darkAqua)
+            w.contentView = NSHostingView(rootView: RouterView())
+            w.setFrameAutosaveName("GPUBuddyRouter")
+            if !w.setFrameUsingName("GPUBuddyRouter") { w.center() }
+            routerWindow = w
+        }
+        routerWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc func toggleCompact() {

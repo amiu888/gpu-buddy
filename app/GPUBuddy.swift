@@ -139,6 +139,19 @@ struct Snapshot: Decodable {
         let ttft_samples: Double?        // requests in the average (same model and cache setting)
         let ttft_pending_since: Double?  // unix time a request still running started (its time comes when it finishes)
         let sources: [Source]
+        /// The LLMs loaded right now (newer gpud): speed now, last speed (kept until the next request), 24h tokens.
+        struct LLM: Decodable, Identifiable {
+            let server: String
+            let model: String
+            let in_flight: Double?
+            let tok_s: Double?
+            let last_tok_s: Double?
+            let last_tok_at: Double?
+            let generated_24h: Double?
+            let prompt_24h: Double?
+            var id: String { server + "/" + model }
+        }
+        let llms: [LLM]?
     }
     struct Power: Decodable {
         let available: Bool
@@ -1987,28 +2000,87 @@ struct TokenCard: View {
 
     var body: some View {
         VStack(spacing: 4) {
-            // Model name banner — prominently shows which LLM is active.
-            if let model = bannerModel, !model.isEmpty {
-                HStack(spacing: 4) {
-                    Image(systemName: "cpu").font(.system(size: 7.5, weight: .medium))
-                    Text(model).font(.system(size: 8, weight: .semibold, design: .rounded))
-                    Spacer()
+            // One row per loaded LLM: its name and speed, and below it the tokens it read and wrote (24 h).
+            // The speed stays after a request ends (dimmed, "last") until the next one; a row goes when the model
+            // is unloaded.
+            if let llms = tokens?.llms {
+                if llms.isEmpty {
+                    Text("No LLM loaded right now.")
+                        .font(.system(size: 9.5, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.5))
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .foregroundColor(.white.opacity(0.7))
-                .lineLimit(1)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(RoundedRectangle(cornerRadius: 5).fill(gold.opacity(0.15)))
-            }
-
-            HStack(spacing: 8) {
-                stat("✍️ GENERATED · 24h", tokens?.generated_24h, live: tokens.flatMap { $0.speed_tok_s > 0 ? "⚡\(Int($0.speed_tok_s)) tok/s" : nil })
-                stat("📖 USED · 24h", tokens?.prompt_24h, live: tokens.flatMap { $0.prompt_per_s > 0 ? "+\(shortCount($0.prompt_per_s))/s" : nil })
+                ForEach(llms) { llmRow($0) }
+                HStack(spacing: 4) {
+                    Text("ALL · 24h").font(.system(size: 8, weight: .black, design: .rounded)).foregroundColor(.white.opacity(0.45))
+                    Spacer(minLength: 2)
+                    Text("📖 \(tokens.map { shortCount($0.prompt_24h) } ?? "--") read   ✍️ \(tokens.map { shortCount($0.generated_24h) } ?? "--") generated")
+                        .font(.system(size: 9, weight: .bold, design: .rounded)).monospacedDigit()
+                        .foregroundColor(gold.opacity(0.85)).lineLimit(1).minimumScaleFactor(0.7)
+                }
+                .padding(.horizontal, 4)
+            } else {
+                // Older gpud: one banner and the two totals.
+                HStack(spacing: 5) {
+                    Image(systemName: "cpu").font(.system(size: 9, weight: .semibold))
+                    Text(bannerModel.map(shortModelName) ?? "No LLM answering yet")
+                        .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                    Spacer(minLength: 4)
+                }
+                .foregroundColor(.white.opacity(0.85))
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: 6).fill(gold.opacity(0.15)))
+                HStack(spacing: 8) {
+                    stat("📖 READ · 24h", tokens?.prompt_24h, live: nil)
+                    stat("✍️ GENERATED · 24h", tokens?.generated_24h, live: tokens.flatMap { $0.speed_tok_s > 0 ? "⚡\(Int($0.speed_tok_s)) tok/s" : nil })
+                }
             }
         }
         .contentShape(Rectangle())
         .onTapGesture { onTap?() }
         .help(sourcesHelp + "\n\nClick for the Token Ledger (⌘L): today, this week, month, YTD, all time.")
+    }
+
+    private func llmRow(_ l: Snapshot.Tokens.LLM) -> some View {
+        let live = (l.in_flight ?? 0) > 0 && (l.tok_s ?? 0) > 0
+        let icon = l.server == "Kapitsa" ? "⚡" : l.server == "Ollama" ? "🦙" : "🧠"
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Text(icon).font(.system(size: 10))
+                Text(shortModelName(l.model.isEmpty ? l.server : l.model))
+                    .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                    .lineLimit(1).minimumScaleFactor(0.7)
+                    .help("\(l.model) on \(l.server)")
+                Text(l.server).font(.system(size: 8.5, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.45))
+                    .lineLimit(1).fixedSize()
+                Spacer(minLength: 4)
+                if live {
+                    Text("⚡\(Int(l.tok_s ?? 0)) tok/s").font(.system(size: 10, weight: .heavy, design: .rounded)).monospacedDigit()
+                        .foregroundColor(gold).lineLimit(1).fixedSize()
+                        .opacity(0.65 + 0.35 * sin(time * 6))
+                } else if let v = l.last_tok_s {
+                    Text("\(v >= 100 ? String(Int(v)) : String(format: "%.1f", v)) tok/s").font(.system(size: 10, weight: .heavy, design: .rounded)).monospacedDigit()
+                        .foregroundColor(gold.opacity(0.75)).lineLimit(1).fixedSize()
+                        .help("Speed of its last answer" + (l.last_tok_at.map { ", \(agoText($0))" } ?? "") + ". Stays until the next one.")
+                } else {
+                    Text("idle").font(.system(size: 9, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.4))
+                }
+            }
+            HStack(spacing: 8) {
+                Text("📖 \(shortCount(l.prompt_24h ?? 0)) read")
+                Text("✍️ \(shortCount(l.generated_24h ?? 0)) generated")
+                Spacer(minLength: 0)
+                if !live, l.last_tok_s != nil, let at = l.last_tok_at {
+                    Text("last · " + agoText(at)).foregroundColor(.white.opacity(0.4))
+                }
+            }
+            .font(.system(size: 8.5, weight: .semibold, design: .rounded)).monospacedDigit()
+            .foregroundColor(.white.opacity(0.7))
+            .lineLimit(1).minimumScaleFactor(0.7)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 7).fill(gold.opacity(live ? 0.22 : 0.12)))
     }
 
     private func activeModel(_ src: [Snapshot.Tokens.Source]) -> String? {
@@ -2078,6 +2150,8 @@ struct LLMRequest: Decodable, Identifiable {
     let output_tokens: Double?
     let est_tokens: Double?        // prompt size guessed from the request's length, when the answer didn't say
     let output_estimated: Bool?    // answer size counted from the streamed pieces
+    let live_tokens: Double?       // written so far, while it's answering
+    let server: String?            // the LLM server the router sent it to
     let ttft: Double?
     let seconds: Double?
     let status: Int?
@@ -2154,9 +2228,15 @@ struct RequestsCard: View {
                     Text("“\(sn)”").font(.system(size: 9, weight: .regular, design: .rounded)).italic()
                         .foregroundColor(.white.opacity(0.8)).lineLimit(1).truncationMode(.tail)
                 }
+                if let m = r.model, !m.isEmpty {
+                    Text("🧠 " + shortModelName(m) + (r.server.map { " · \($0)" } ?? ""))
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundColor(.white.opacity(0.75)).lineLimit(1).minimumScaleFactor(0.7)
+                }
                 if !details(r).isEmpty {
                     Text(details(r)).font(.system(size: 8.5, weight: .semibold, design: .rounded)).monospacedDigit()
-                        .foregroundColor(.white.opacity(0.5)).lineLimit(1)
+                        .foregroundColor(Color(red: 1, green: 0.85, blue: 0.5).opacity(0.85))
+                        .lineLimit(1).minimumScaleFactor(0.65)
                 }
             }
         }
@@ -2186,14 +2266,24 @@ struct RequestsCard: View {
             .foregroundColor(color).lineLimit(1).fixedSize()
     }
 
+    /// The token line: read, written, writing speed, first-token time.
     private func details(_ r: LLMRequest) -> String {
         var parts: [String] = []
-        if let m = r.model, !m.isEmpty { parts.append(m) }
-        if let p = r.readText { parts.append("📖 \(p) read") }
+        if let p = r.readText { parts.append("📖 \(p)") }
+        let now = Date().timeIntervalSince1970
+        if r.running, let n = r.live_tokens, n > 0 {
+            parts.append("✍️ \(shortCount(n))")
+            if let t = r.ttft, now - r.started - t > 0.2 { parts.append("⚡\(Int(n / (now - r.started - t))) tok/s") }
+        } else if let o = r.wroteText {
+            parts.append("✍️ \(o)")
+            if let n = r.output_tokens, n >= 5, let s = r.seconds {
+                let gen = (r.ttft.map { s - $0 > 0.2 ? s - $0 : s }) ?? s
+                if gen > 0.05 { parts.append("⚡\(Int(n / gen)) tok/s") }
+            }
+        }
         if let t = r.ttft { parts.append("⏱ \(ttftText(t))") }
-        if let o = r.wroteText { parts.append("✍️ \(o)") }
-        if let s = r.seconds, !r.running { parts.append("\(ttftText(s)) total") }
-        return parts.isEmpty ? (r.path ?? "") : parts.joined(separator: " · ")
+        if parts.isEmpty, r.model == nil { return r.path ?? "" }
+        return parts.joined(separator: "  ")
     }
 
     private func helpText(_ r: LLMRequest) -> String {
@@ -2822,6 +2912,26 @@ struct ContentView: View {
         .help("Change character (⌘J)")
     }
 
+    /// Opens the LLM Router: a tiny version of its diagram (one entry fanning out to two servers) with a status light.
+    #if os(macOS)
+    @ViewBuilder private var routerButton: some View {
+        if store.host.isLocal {
+            let lr = store.online ? store.shown?.llm_requests : nil
+            let busy = !(lr?.active.isEmpty ?? true)
+            Button { NotificationCenter.default.post(name: .openRouter, object: nil) } label: {
+                RouterGlyph(on: lr?.on ?? false, busy: busy, time: anim.time)
+                    .frame(width: 18, height: 18)
+                    .background(Circle().fill(.white.opacity(0.16)))
+            }
+            .buttonStyle(.plain)
+            .help(lr?.on == true
+                  ? (busy ? "LLM Router: answering \(lr!.active.count) request\(lr!.active.count == 1 ? "" : "s") now. Click to see who's connected (⌘E)"
+                          : "LLM Router is on: see who connects to your local AI and where it goes (⌘E)")
+                  : "LLM Router: share your local AI with other devices and apps (⌘E)")
+        }
+    }
+    #endif
+
     private func modeButton(_ symbol: String) -> some View {
         Button { fleet.compact.toggle() } label: {
             Image(systemName: symbol)
@@ -2843,6 +2953,9 @@ struct ContentView: View {
                 .overlay(WindowDragArea())
                 .overlay(alignment: .topTrailing) {
                     HStack(spacing: 5) {
+                        #if os(macOS)
+                        routerButton
+                        #endif
                         characterMenu
                         #if os(macOS)
                         modeButton("rectangle.compress.vertical")
@@ -2980,8 +3093,11 @@ struct ContentView: View {
                     Text(moodLabel[store.mood] ?? "")
                         .font(.system(size: 9.5, weight: .black, design: .rounded))
                         .foregroundColor(moodColor)
-                        .lineLimit(1).fixedSize()
+                        .lineLimit(1).minimumScaleFactor(0.7)
                     Spacer(minLength: 0)
+                    #if os(macOS)
+                    routerButton
+                    #endif
                     modeButton("rectangle.expand.vertical")
                 }
                 MemoryTank(anim: anim).frame(height: 7)
@@ -2991,16 +3107,25 @@ struct ContentView: View {
                     .foregroundColor(.white.opacity(0.6))
                     .lineLimit(1).minimumScaleFactor(0.75)
                 if let tk = store.online ? s?.tokens : nil {
-                    Text("✍️\(shortCount(tk.generated_24h)) 📖\(shortCount(tk.prompt_24h))\(tk.speed_tok_s > 0 ? " ⚡\(Int(tk.speed_tok_s))/s" : " tokens")")
-                        .font(.system(size: 9, weight: .semibold, design: .rounded)).monospacedDigit()
-                        .foregroundColor(Color(red: 1, green: 0.85, blue: 0.5))
-                        .lineLimit(1)
-                        .onTapGesture { fleet.onOpenLedger?() }
-                        .help("Click for the Token Ledger (⌘L)")
+                    VStack(alignment: .leading, spacing: 1) {
+                        if let m = tk.sources.first(where: { $0.tok_s > 0 }).map({ $0.model.isEmpty ? $0.name : $0.model }) ?? tk.ttft_model {
+                            Text("🧠 " + shortModelName(m) + (tk.speed_tok_s > 0 ? "  ⚡\(Int(tk.speed_tok_s))/s" : ""))
+                                .font(.system(size: 9, weight: .bold, design: .rounded))
+                                .foregroundColor(.white.opacity(0.85))
+                                .lineLimit(1).minimumScaleFactor(0.7)
+                                .help(m)
+                        }
+                        Text("📖 read \(shortCount(tk.prompt_24h))  ✍️ generated \(shortCount(tk.generated_24h))")
+                            .font(.system(size: 9, weight: .semibold, design: .rounded)).monospacedDigit()
+                            .foregroundColor(Color(red: 1, green: 0.85, blue: 0.5))
+                            .lineLimit(1).minimumScaleFactor(0.7)
+                    }
+                    .onTapGesture { fleet.onOpenLedger?() }
+                    .help("Tokens in the last 24 hours. Click for the Token Ledger (⌘L)")
                 }
                 Text(topProcesses(s, 1).first.map { "\($0.is_ai ? "🤖 " : "")\($0.label)" } ?? (store.online ? "😴 nothing running" : "gpud offline"))
                     .font(.system(size: 9.5, weight: .semibold, design: .rounded))
-                    .lineLimit(1).truncationMode(.middle)
+                    .lineLimit(1).minimumScaleFactor(0.7).truncationMode(.middle)
                     .help(topProcesses(s, 1).first?.command ?? "")
                 // Little thermometer and stopwatch chips: GPU temperature and time to first token.
                 // The row always keeps its height, so the window doesn't jump when they appear.
@@ -3017,7 +3142,7 @@ struct ContentView: View {
             }
         }
         .padding(8)
-        .frame(width: 250)
+        .frame(width: 272)
     }
 
     private func requestsSummary(_ lr: Snapshot.LLMRequests) -> String {
@@ -3030,7 +3155,7 @@ struct ContentView: View {
 
     private func tokenSummary(_ s: Snapshot?) -> String {
         guard store.online, let tk = s?.tokens else { return "--" }
-        return "✍️\(shortCount(tk.generated_24h)) 📖\(shortCount(tk.prompt_24h))" + (tk.speed_tok_s > 0 ? " ⚡\(Int(tk.speed_tok_s))/s" : "")
+        return "📖\(shortCount(tk.prompt_24h)) ✍️\(shortCount(tk.generated_24h))" + (tk.speed_tok_s > 0 ? " ⚡\(Int(tk.speed_tok_s))/s" : "")
     }
 
     private func powerSummary(_ s: Snapshot?) -> String {
@@ -3082,7 +3207,7 @@ struct FoldSection<Content: View>: View {
                         Text(summary)
                             .font(.system(size: 10, weight: .bold, design: .rounded)).monospacedDigit()
                             .foregroundColor(.white.opacity(open ? 1 : 0.8))
-                            .lineLimit(1).truncationMode(.tail)
+                            .lineLimit(1).minimumScaleFactor(0.6)  // shrink to fit rather than end in "…"
                     }
                 }
                 .foregroundColor(.white.opacity(0.45))
@@ -3538,41 +3663,11 @@ struct RequestLogSettings: View {
                     .help("Shows what each request is about. It stays on this Mac, is never sent to your other Macs, and is deleted after \(st.retention_days) days.")
                 #endif
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Other devices allowed").font(.system(size: 10.5, weight: .semibold, design: .rounded))
-                    HStack(spacing: 6) {
-                        TextField("e.g. 10.0.2.126", text: $log.allowText)
-                            .textFieldStyle(.roundedBorder).font(.system(size: 10.5, design: .monospaced))
-                            .onSubmit { saveAllow() }
-                        Button("Save") { saveAllow() }
-                            .disabled(log.allowText == st.allow.joined(separator: ", "))
-                    }
-                    Text("This Mac is always allowed. Separate addresses with commas; 10.0.2.0/24 allows a whole network, * allows everyone.")
-                        .font(small).foregroundColor(.white.opacity(0.5)).fixedSize(horizontal: false, vertical: true)
-                }
-
-                VStack(alignment: .leading, spacing: 3) {
-                    if st.key_required, let key = st.api_key {
-                        HStack(spacing: 6) {
-                            Text("API key").font(.system(size: 10.5, weight: .semibold, design: .rounded))
-                            Text(String(key.prefix(6)) + "••••••" + String(key.suffix(4)))
-                                .font(.system(size: 10.5, design: .monospaced)).foregroundColor(.white.opacity(0.7))
-                            #if os(macOS)
-                            Button(copied ? "Copied" : "Copy") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(key, forType: .string)
-                                copied = true
-                            }
-                            #endif
-                            Button("Remove") { Task { await log.send(["remove_api_key": true]) } }
-                        }
-                        Text("Other devices must send this key (in Cline: the API Key field). This Mac doesn't need it.")
-                            .font(small).foregroundColor(.white.opacity(0.5)).fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        Button("Require an API key from other devices") { Task { await log.send(["new_api_key": true]) } }
-                    }
-                }
-
+                #if os(macOS)
+                Text("Who may connect, client keys, extra entry ports and which LLM server answers are set in the LLM Router.")
+                    .font(small).foregroundColor(.white.opacity(0.5)).fixedSize(horizontal: false, vertical: true)
+                Button("Open the LLM Router…") { NotificationCenter.default.post(name: .openRouter, object: nil) }
+                #endif
                 Button("Open the Request Log") { NotificationCenter.default.post(name: .openRequestLog, object: nil) }
             } else {
                 Text("GPU Buddy sits in front of your LLM server on port 8080 and notes which app or device asks, the agent (Claude Code, Cline…), sizes and timings. Your server moves to port 8081 for this Mac only (GPU Buddy edits its start script and keeps a backup), so apps keep their settings. Turning this off puts everything back.")
@@ -4598,4 +4693,53 @@ struct LedgerView: View {
             }
         }
     }
+}
+
+
+#if os(macOS)
+/// The router button's picture: a little Wi-Fi-style router with a face. Its eyes are the status lights: green when the
+/// router is on, grey when off, and they blink in turn while apps are asking.
+struct RouterGlyph: View {
+    let on: Bool
+    let busy: Bool
+    let time: Double
+    var body: some View {
+        Canvas { ctx, size in
+            let w = size.width, h = size.height
+            let body = CGRect(x: w * 0.2, y: h * 0.47, width: w * 0.6, height: h * 0.32)
+            // antennas with round tips
+            var ant = Path()
+            ant.move(to: CGPoint(x: w * 0.33, y: body.minY)); ant.addLine(to: CGPoint(x: w * 0.27, y: h * 0.22))
+            ant.move(to: CGPoint(x: w * 0.67, y: body.minY)); ant.addLine(to: CGPoint(x: w * 0.73, y: h * 0.22))
+            ctx.stroke(ant, with: .color(.white.opacity(0.9)), style: StrokeStyle(lineWidth: 1.1, lineCap: .round))
+            for x in [0.27, 0.73] {
+                ctx.fill(Path(ellipseIn: CGRect(x: w * x - 1.3, y: h * 0.22 - 1.3, width: 2.6, height: 2.6)), with: .color(.white))
+            }
+            ctx.fill(Path(roundedRect: body, cornerRadius: 2.2), with: .color(.white))
+            // eyes = status lights
+            let lit = on ? Color(red: 0.2, green: 0.78, blue: 0.4) : Color(white: 0.55)
+            for (k, x) in [0.39, 0.61].enumerated() {
+                let blink = busy && Int(time * 4) % 2 == k
+                let col = blink ? Color(red: 0.55, green: 1, blue: 0.65) : lit
+                ctx.fill(Path(ellipseIn: CGRect(x: w * x - 1.25, y: body.minY + body.height * 0.22, width: 2.5, height: 2.5)), with: .color(col))
+            }
+            // smile
+            var smile = Path()
+            smile.move(to: CGPoint(x: w * 0.45, y: body.minY + body.height * 0.7))
+            smile.addQuadCurve(to: CGPoint(x: w * 0.55, y: body.minY + body.height * 0.7),
+                               control: CGPoint(x: w * 0.5, y: body.minY + body.height * 0.92))
+            ctx.stroke(smile, with: .color(Color(red: 0.1, green: 0.09, blue: 0.15)), style: StrokeStyle(lineWidth: 0.8, lineCap: .round))
+        }
+    }
+}
+#endif
+
+
+/// A model name short enough to read: a folder path becomes its folder name
+/// ("/Users/me/.local/share/qwen36-moe-mlx/model" -> "qwen36-moe-mlx").
+func shortModelName(_ m: String) -> String {
+    guard m.contains("/") else { return m }
+    let parts = m.split(separator: "/").map(String.init).filter { !$0.isEmpty }
+    let generic: Set<String> = ["model", "models", "snapshots", "main", "mlx", "weights"]
+    return parts.last(where: { !generic.contains($0.lowercased()) && !$0.hasPrefix("sha256") }) ?? parts.last ?? m
 }

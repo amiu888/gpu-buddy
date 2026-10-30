@@ -72,6 +72,19 @@ gpud finds local LLM servers by looking for AI-looking processes that listen on 
 
 **Who's asking** (Settings → Who's Using My LLM, off by default): GPU Buddy sits in front of your LLM server on its usual port (8080) and shows each request live: the agent (Claude Code, Cline, Codex, curl…), which program or device sent it, prompt and answer tokens, and time to first token. Optionally it keeps the first 100 characters of the user's message. Your server moves to the next port (8081) for this Mac only; GPU Buddy edits the one line of its start script or LaunchAgent that sets the port, keeps a backup, and puts it back when you turn this off or remove the service. Only this Mac and the addresses you allow can use the server, and you can require an API key from other devices. The log stays on this Mac (`~/Library/Application Support/GPUBuddy/llm-requests.jsonl`, readable by you only) for 7 days and never holds request headers, whole prompts or answers. Snippets aren't sent to paired Macs or web pages. The proxy lives in `daemon/llmproxy.py`; the API is `GET/POST /api/v1/llm-proxy` (this Mac only).
 
+**LLM Router** (menu → LLM Router…, ⌘E): a diagram of who connects, through which entry port, to which LLM server.
+- **Servers:** GPU Buddy finds the LLM servers on this Mac every 15 seconds (Kapitsa, Ollama, LM Studio, llama.cpp, MLX, vLLM, SGLang…) with their models. You can add others by address.
+- **Entry ports:** each port GPU Buddy listens on is open to the whole network or to this Mac only. It either always uses one server, or sends each request to the server that has the model it names, falling back to a default server.
+- **Model list:** `GET /v1/models` on such a port lists every server's models.
+- **Client keys:** make one per app or device, for all entry ports or only some. The panel shows ready-to-paste settings (base URL, key, model) and when the key was last used.
+- **Access:** devices on the allow list get in without a key, unless "every other device also needs a client key" is on. This Mac is always allowed.
+- **Warnings:** a server that also listens on the network by itself is flagged, since devices could skip GPU Buddy.
+- **Copy buttons:** every address, model name and client setup can be copied with one click.
+- **Models…:** what's in use (which clients, requests in the last 24 hours, tokens per second), what's on this Mac, what's on the NAS (copy it to this Mac), and Ollama's whole library from ollama.com (download any size into Ollama, with progress). The API is `GET/POST /api/v1/llm-proxy/models` (this Mac only; see `daemon/modellib.py`).
+- Open it from the little router with antennas in the main window's top-right corner. Its eyes are green when the router is on and blink while apps are asking.
+
+The **TOKENS** section lists every loaded LLM (Kapitsa's model, and each model Ollama holds in memory) with its tokens per second on the right. The speed of the last answer stays until the next request, and the row goes when the model is unloaded. Below each name are the tokens it read and generated in the last 24 hours. Each **Who's asking** item shows the LLM on one line and its tokens on the next: read, written, tokens per second and time to first token.
+
 Token usage is kept **forever**, per hour and per model, so the Token Ledger can show any period. Weeks start on the day your Mac's calendar uses (`week_start=1` for Sunday, `2` for Monday in the API).
 
 ## Power
