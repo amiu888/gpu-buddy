@@ -68,7 +68,7 @@ from urllib.parse import parse_qs, urlparse
 import llmproxy
 import modellib
 
-VERSION = "1.14.0"
+VERSION = "1.14.1"
 RETENTION_SECONDS = 24 * 3600
 STATE_DIR = os.path.expanduser("~/Library/Application Support/GPUBuddy")
 DEFAULT_DB = os.path.join(STATE_DIR, "history.db")
