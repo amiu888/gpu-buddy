@@ -7,11 +7,13 @@
 #
 # Signing uses your "Apple Development" certificate and a matching development provisioning profile
 # from Xcode (a wildcard team profile works). Override with GPUBUDDY_TEAM, GPUBUDDY_IDENTITY,
-# GPUBUDDY_PROFILE or GPUBUDDY_BUNDLE_ID.
+# GPUBUDDY_PROFILE, GPUBUDDY_BUNDLE_ID or GPUBUDDY_BUILD_NUMBER (CFBundleVersion).
 set -euo pipefail
 cd "$(dirname "$0")"
 MODE="${1:-sim}"
 VERSION="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' ../daemon/gpud.py)"
+# CFBundleVersion: each TestFlight/App Store upload needs a new, higher build number.
+BUILD="${GPUBUDDY_BUILD_NUMBER:-$VERSION}"
 BUNDLE_ID="${GPUBUDDY_BUNDLE_ID:-local.gpubuddy.ios}"
 OUT="build-ios/$MODE"
 APP="$OUT/GPU Buddy.app"
@@ -54,7 +56,7 @@ cat > "$APP/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>GPUBuddy</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD</string>
   <key>CFBundleSupportedPlatforms</key><array><string>$([ "$SDK" = iphoneos ] && echo iPhoneOS || echo iPhoneSimulator)</string></array>
   <key>MinimumOSVersion</key><string>17.0</string>
   <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
