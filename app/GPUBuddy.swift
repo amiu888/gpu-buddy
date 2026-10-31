@@ -304,7 +304,7 @@ struct Health: Decodable {
     let host: HostInfo?
 }
 
-struct Pairing: Decodable {
+struct Pairing: Decodable, Equatable {
     let remote: Bool
     let code: String?
     let id: String?
@@ -564,9 +564,33 @@ final class Fleet: ObservableObject {
     func start() {
         stores.filter { Self.hasLocal || !$0.host.isLocal }.forEach { $0.start() }
         browse()
-        Task {
-            if Self.hasLocal { thisMac = await stores[0].client.get("/api/v1/pairing") }
-            update(found: seen)
+        watchThisMac()
+    }
+
+    private var thisMacTask: Task<Void, Never>?
+
+    /// Keeps this Mac's pairing code fresh. Right after login the app can start before gpud does,
+    /// so ask every 3 s until gpud answers, then once a minute (in case gpud restarts or its
+    /// settings change). macOS only: iPhones and iPads have no local gpud.
+    private func watchThisMac() {
+        guard Self.hasLocal, thisMacTask == nil else { return }
+        thisMacTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.refreshThisMac()
+                let seconds: UInt64 = self.thisMac == nil ? 3 : 60
+                try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+            }
+        }
+    }
+
+    /// Asks the local gpud for this Mac's pairing code now (also when the Macs panel opens).
+    /// A failed request keeps the last code: it stays valid across gpud restarts.
+    func refreshThisMac() async {
+        guard Self.hasLocal, let local = stores.first(where: { $0.host.isLocal }) else { return }
+        if let p: Pairing = await local.client.get("/api/v1/pairing"), p != thisMac {
+            thisMac = p
+            update(found: seen)  // hides this Mac from the "found" list once its id is known
         }
     }
 

@@ -173,6 +173,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.backgroundColor = NSColor(red: 0.1, green: 0.09, blue: 0.15, alpha: 1)
         window.appearance = NSAppearance(named: .darkAqua)
         window.contentView = NSHostingView(rootView: RootView(fleet: fleet, characters: characters, anim: Anim()))
+        // Keep the window after it's closed: the Dock icon, menus, and observers below all reopen or
+        // message it, and a released window made the Dock click crash (EXC_BAD_ACCESS).
+        window.isReleasedWhenClosed = false
         window.delegate = self
         window.setFrameAutosaveName("GPUBuddyWindow")
         let restored = window.setFrameUsingName("GPUBuddyWindow")
@@ -391,6 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             macsWindow = w
         }
         macsWindow?.makeKeyAndOrderFront(nil)
+        Task { await fleet.refreshThisMac() }  // show this Mac's code right away if gpud just came up
     }
 
     @objc func openAbout() {
@@ -459,6 +463,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard let window else { return true }  // not built yet (still launching)
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         return true
