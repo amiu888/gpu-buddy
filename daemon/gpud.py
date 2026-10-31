@@ -1589,15 +1589,25 @@ PRICES_BACKUP_DIR = os.path.join(STATE_DIR, "prices_history")  # dated copies of
 
 
 def load_prices():
-    """Frontier model prices: the user's copy in STATE_DIR if there is one, else the one shipped with gpud."""
+    """Frontier model prices: the user's copy in STATE_DIR, else the one shipped with gpud.
+
+    The shipped file wins when its `as_of` date is newer than the user's copy, so an update that brings new
+    prices isn't hidden by an older copy (gpud 1.12.0 to 1.14.0 wrote one by itself). To keep your own edits
+    across updates, set `as_of` in your copy to the date you edited it.
+    """
+    found = []
     for path in (os.path.join(STATE_DIR, "prices.json"),
                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "prices.json")):
         try:
             with open(path) as f:
-                return json.load(f)
+                found.append(json.load(f))
         except (OSError, ValueError):
             continue
-    return {"models": []}
+    if not found:
+        return {"models": []}
+    if len(found) == 2 and str(found[1].get("as_of") or "") > str(found[0].get("as_of") or ""):
+        return found[1]
+    return found[0]
 
 
 def save_prices(prices):
@@ -1626,48 +1636,44 @@ def backup_prices(prices):
         pass
 
 
-_PRICES_UPDATE_INTERVAL = 3600  # check for pricing updates every hour
+_PRICES_UPDATE_INTERVAL = 3600  # look for a changed price table every hour
+
+
+def _latest_backup():
+    """The newest dated copy in PRICES_BACKUP_DIR, or None."""
+    try:
+        files = sorted(f for f in os.listdir(PRICES_BACKUP_DIR) if f.endswith(".json"))
+        if files:
+            with open(os.path.join(PRICES_BACKUP_DIR, files[-1])) as f:
+                return json.load(f)
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def update_prices():
-    """Fetch pricing from sources and merge into the current prices file. Returns True if changed."""
+    """Keep the price history: save a dated copy whenever the price table in use changes.
+
+    Returns True when a copy was saved. Nothing is fetched from the internet and the user's prices.json is
+    never written: provider pricing pages are HTML, so earlier versions downloaded them every hour for nothing
+    and then saved a copy of the shipped prices that hid newer ones after an update.
+    """
     current = load_prices()
-    models_by_key = {}
-    for m in current.get("models", []):
-        models_by_key[(m.get("provider"), m.get("model"))] = dict(m)
-    sources = current.get("sources", [])
-    if not sources:
+    strip = lambda p: {k: v for k, v in (p or {}).items() if k != "last_updated"}
+    if strip(current) == strip(_latest_backup()):
         return False
-    changed = False
-    for url in sources:
-        try:
-            body = http_get(url)
-            text = body.decode(errors="replace").lower()
-            # Try to parse a JSON pricing table
-            if "application/json" in text[:200] or "{\n" in text or '{"' in text:
-                continue  # not a simple JSON endpoint
-            # Most source URLs are HTML documentation pages; we skip them unless they contain
-            # a recognizable pricing JSON. For now, treat them as static (as before).
-            # A "last_updated" write is enough to mark freshness.
-            # If the file has no last_updated, write one now.
-        except Exception:
-            pass
-    # Write/update last_updated on the next save cycle.
-    # Always save a backup of current prices so users get history.
-    if "last_updated" not in current or changed:
-        backup_prices(current)
-    return False  # no model changes from scraping (HTML docs)
+    backup_prices(current)
+    return True
 
 
 def _prices_update_thread():
-    """Background thread that checks for pricing updates every _PRICES_UPDATE_INTERVAL seconds."""
+    """Background thread that records price-table changes every _PRICES_UPDATE_INTERVAL seconds."""
     while True:
-        time.sleep(_PRICES_UPDATE_INTERVAL)
         try:
             update_prices()
-            save_prices(load_prices())
         except Exception:
             pass
+        time.sleep(_PRICES_UPDATE_INTERVAL)
 
 
 def cloud_cost(usage, cache_hit=0.0, batch=False, thinking=0.0, tokenizer=1.0, reuse=10.0):
