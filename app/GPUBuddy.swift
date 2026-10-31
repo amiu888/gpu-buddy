@@ -293,7 +293,13 @@ struct HostRecord: Codable, Identifiable, Equatable {
     var address: String  // "Studio.local:8766"
     var token: String = ""
     var isLocal: Bool { id == "local" }
-    var title: String { isLocal ? "This Mac" : name }
+    var title: String { isLocal ? "This Mac" : isDemo ? "\(name) (sample data)" : name }
+
+    /// The built-in Demo Mac: sample data, no network (see DemoFeed).
+    static let demoID = "demo"
+    static let demoName = "Demo Mac"
+    static let demo = HostRecord(id: demoID, name: demoName, address: "sample data")
+    var isDemo: Bool { id == Self.demoID }
 }
 
 struct Health: Decodable {
@@ -320,16 +326,29 @@ final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     let base: String
     private let token: String?
     private let pin: String?
+    /// Set for the Demo Mac: answers come from built-in sample data and nothing touches the network.
+    private let demo: DemoFeed?
     private let lock = NSLock()
     private var _problem: String?
     private var pinFailed = false
-    private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
+    // Starting a task on an invalidated URLSession throws an Objective-C exception (a crash), and a store
+    // can be stopped while one of its requests is mid-flight (Bonjour moving a Mac to a new address swaps
+    // its store). So requests are counted, nothing starts once closed, and the session is invalidated
+    // only after the last request in flight is done.
+    private var closed = false
+    private var inFlight = 0
+    private var _session: URLSession?
 
     /// Why the last request failed, in words.
     var problem: String? { lock.withLock { _problem } }
 
     init(host: HostRecord, localPort: Int) {
-        if host.isLocal {
+        demo = host.isDemo ? DemoFeed() : nil
+        if host.isDemo {
+            base = "demo:"
+            token = nil
+            pin = nil
+        } else if host.isLocal {
             base = "http://127.0.0.1:\(localPort)"  // loopback never leaves this Mac
             token = nil
             pin = nil
@@ -341,9 +360,12 @@ final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     }
 
     func get<T: Decodable>(_ path: String, timeout: Double = 2) async -> T? {
+        if let demo { return demo.response(path).flatMap { try? JSONDecoder().decode(T.self, from: $0) } }
         var req = URLRequest(url: URL(string: base + path)!)
         req.timeoutInterval = timeout
         if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        guard let session = begin() else { return nil }
+        defer { end() }
         do {
             let (data, resp) = try await session.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -358,7 +380,37 @@ final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         }
     }
 
-    func close() { session.invalidateAndCancel() }
+    /// Stops this client for good: requests in flight are cancelled, new ones return nil.
+    func close() {
+        let (session, idle): (URLSession?, Bool) = lock.withLock {
+            closed = true
+            return (_session, inFlight == 0)
+        }
+        guard let session else { return }  // never made a request (or the Demo Mac, which never needs one)
+        if idle {
+            session.invalidateAndCancel()
+        } else {
+            session.getAllTasks { $0.forEach { $0.cancel() } }  // end() invalidates once they've all returned
+        }
+    }
+
+    /// The session for one request, or nil once closed.
+    private func begin() -> URLSession? {
+        lock.withLock {
+            guard !closed else { return nil }
+            inFlight += 1
+            if _session == nil { _session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil) }
+            return _session
+        }
+    }
+
+    private func end() {
+        let last: URLSession? = lock.withLock {
+            inFlight -= 1
+            return closed && inFlight == 0 ? _session : nil
+        }
+        last?.invalidateAndCancel()
+    }
 
     func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge) async
         -> (URLSession.AuthChallengeDisposition, URLCredential?) {
@@ -402,6 +454,8 @@ final class GPUStore: ObservableObject {
     private var timer: Timer?
     private var ticks = 0
     private var replayTask: Task<Void, Never>?
+    /// Set by stop(): a poll that was mid-flight then leaves the store alone.
+    private var stopped = false
 
     init(host: HostRecord, localPort: Int) {
         self.host = host
@@ -429,7 +483,8 @@ final class GPUStore: ObservableObject {
     }
 
     func fetchTimeline() async {
-        if let tl: Timeline = await client.get("/api/v1/history?seconds=\(Int(range))&points=300") { timeline = tl }
+        guard !stopped else { return }
+        if let tl: Timeline = await client.get("/api/v1/history?seconds=\(Int(range))&points=300"), !stopped { timeline = tl }
     }
 
     func start() {
@@ -441,14 +496,19 @@ final class GPUStore: ObservableObject {
     }
 
     func stop() {
+        stopped = true
         timer?.invalidate()
+        timer = nil
         replayTask?.cancel()
         client.close()
     }
 
     private func poll() async {
+        guard !stopped else { return }
         let t0 = Date()
-        if let s: Snapshot = await client.get("/api/v1/status") {
+        let status: Snapshot? = await client.get("/api/v1/status")
+        guard !stopped else { return }  // stopped (replaced or forgotten) while waiting
+        if let s = status {
             latency = Date().timeIntervalSince(t0) * 1000
             snap = s
             online = true
@@ -464,6 +524,7 @@ final class GPUStore: ObservableObject {
         }
         problem = online ? nil : client.problem
         if online && active && (timeline == nil || ticks % 10 == 0) { await fetchTimeline() }
+        guard !stopped else { return }
         ticks += 1
         onUpdate?(self)
     }
@@ -529,8 +590,9 @@ final class Fleet: ObservableObject {
         self.localPort = localPort
         var records = [HostRecord(id: "local", name: "This Mac", address: "127.0.0.1:\(localPort)")]
         if let data = try? Data(contentsOf: file), let saved = try? JSONDecoder().decode([HostRecord].self, from: data) {
-            records += saved.filter { !$0.isLocal }
+            records += saved.filter { !$0.isLocal && !$0.isDemo }
         }
+        if Self.demoWanted(paired: records.count > 1) { records.append(.demo) }
         let all = records.map { GPUStore(host: $0, localPort: localPort) }
         stores = all
         let saved = all.first { $0.host.id == UserDefaults.standard.string(forKey: "selectedHost") }
@@ -556,6 +618,31 @@ final class Fleet: ObservableObject {
         #else
         false
         #endif
+    }
+
+    /// The Demo Mac's setting: "on" (added from Macs), "off" (removed with its trash button), or unset:
+    /// then iPhones and iPads show it until a real Mac is paired, and Macs (which have their own gpud) don't.
+    private static let demoKey = "demoMac"
+    private static func demoWanted(paired: Bool) -> Bool {
+        switch UserDefaults.standard.string(forKey: demoKey) {
+        case "on": return true
+        case "off": return false
+        default: return !hasLocal && !paired
+        }
+    }
+
+    /// The built-in Demo Mac, when it's in the list.
+    var demo: GPUStore? { stores.first { $0.host.isDemo } }
+
+    /// Shows the Demo Mac, adding it back first if it was removed.
+    func showDemo() {
+        UserDefaults.standard.set("on", forKey: Self.demoKey)
+        if let d = demo { return select(d) }
+        let s = GPUStore(host: .demo, localPort: localPort)
+        wire(s)
+        stores.append(s)
+        s.start()
+        select(s)
     }
 
     /// The Macs to show: on iOS, the local placeholder is left out.
@@ -638,11 +725,21 @@ final class Fleet: ObservableObject {
         s.start()
         save()
         select(s)
+        // A real Mac is here now, so the demo steps aside (it can be added back from Macs).
+        if let d = demo {
+            UserDefaults.standard.removeObject(forKey: Self.demoKey)
+            drop(d)
+        }
         return nil
     }
 
     func remove(_ id: String) {
         guard id != "local", let s = stores.first(where: { $0.host.id == id }) else { return }
+        if s.host.isDemo { UserDefaults.standard.set("off", forKey: Self.demoKey) }
+        drop(s)
+    }
+
+    private func drop(_ s: GPUStore) {
         if s === current { select(watched.first { $0 !== s } ?? stores[0]) }
         s.stop()
         stores.removeAll { $0 === s }
@@ -650,7 +747,7 @@ final class Fleet: ObservableObject {
     }
 
     private func save() {
-        let remote = stores.map(\.host).filter { !$0.isLocal }
+        let remote = stores.map(\.host).filter { !$0.isLocal && !$0.isDemo }
         guard let data = try? JSONEncoder().encode(remote) else { return }
         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: file.path, contents: data, attributes: [.posixPermissions: 0o600])
@@ -694,6 +791,349 @@ final class Fleet: ObservableObject {
             }
             save()
         }
+    }
+}
+
+// MARK: - Demo Mac (built-in sample data, so the app can be tried without a Mac running gpud)
+
+/// A pretend Mac that answers the same requests as gpud from data made up on the device, so new users
+/// (and App Review) can see every screen before pairing a real Mac. It's shaped after a Mac Studio
+/// (M4 Max) running local LLMs: the load, power, token speeds and daily totals follow what gpud recorded
+/// there, but nothing in it is real. No network, no real names, addresses, paths or prompts.
+/// It loops through every mood (napping, chilling, working, hustling, turbo) every 2½ minutes.
+final class DemoFeed: @unchecked Sendable {
+    static let cycle = 150.0
+    private let cal = Calendar.current
+
+    /// The same answer gpud would give for this path, as JSON.
+    func response(_ path: String) -> Data? {
+        guard let url = URLComponents(string: "demo://mac" + path) else { return nil }
+        var q: [String: String] = [:]
+        for i in url.queryItems ?? [] { q[i.name] = i.value ?? "" }
+        let num = { (k: String, d: Double) in q[k].flatMap(Double.init) ?? d }
+        let now = Date().timeIntervalSince1970
+        let obj: Any?
+        switch url.path {
+        case "/health": obj = ["ok": true, "id": HostRecord.demoID, "name": HostRecord.demoName, "model": "Apple M4 Max", "host": host]
+        case "/api/v1/status": obj = snapshot(now)
+        case "/api/v1/at": obj = snapshot(min(num("t", now), now))
+        case "/api/v1/history": obj = history(seconds: num("seconds", 3600), points: Int(num("points", 300)), now: now)
+        case "/api/v1/usage": obj = usage(from: num("from", 0), to: num("to", now), group: q["group"], now: now)
+        case "/api/v1/usage/summary": obj = summary(weekStart: Int(num("week_start", Double(cal.firstWeekday))), now: now)
+        case "/api/v1/cost":
+            obj = cost(from: num("from", 0), to: num("to", now), cacheHit: num("cache_hit", 0), thinking: num("thinking", 0),
+                       tokenizer: num("tokenizer", 1), batch: q["batch"] == "1", now: now)
+        default: obj = nil  // no pairing code, no request log, no settings: it's not a real Mac
+        }
+        return obj.flatMap { try? JSONSerialization.data(withJSONObject: $0) }
+    }
+
+    // MARK: The loop
+
+    /// GPU load (0–100) through one loop: a nap, a chill spell, then an LLM answer that ramps up to turbo.
+    private static let keys: [(Double, Double)] = [
+        (0, 2), (18, 3), (24, 13), (38, 22), (44, 47), (58, 58), (64, 79), (74, 84), (80, 95), (108, 96),
+        (114, 55), (128, 31), (134, 15), (146, 3), (150, 2),
+    ]
+
+    private func phase(_ t: Double) -> (n: Double, x: Double) {
+        let n = floor(t / Self.cycle)
+        return (n, t - n * Self.cycle)
+    }
+
+    /// The load at time t, with a little jitter; some loops stop at hustling instead of turbo.
+    func load(_ t: Double) -> Double {
+        let (n, x) = phase(t)
+        var i = 1
+        while i < Self.keys.count - 1 && Self.keys[i].0 < x { i += 1 }
+        let (x0, y0) = Self.keys[i - 1], (x1, y1) = Self.keys[i]
+        let f = (x - x0) / max(x1 - x0, 0.001)
+        var u = y0 + (y1 - y0) * (f * f * (3 - 2 * f))
+        if u > 60 { u = 60 + (u - 60) * (Int(n) % 4 == 2 ? 0.7 : 0.94 + 0.06 * hash(n)) }
+        u += (hash(floor(t) * 0.37 + 1) - 0.5) * (u > 10 ? 7 : 2)
+        return max(0, min(100, u))
+    }
+
+    /// An LLM is answering (from the first prompt token until the answer ends).
+    private func ai(_ t: Double) -> Bool { (40.0..<114).contains(phase(t).x) }
+    /// Tokens written per second.
+    private func genRate(_ t: Double) -> Double {
+        let x = phase(t).x
+        guard ai(t), x >= 46 else { return 0 }
+        return max(0, load(t) * 1.12 + (hash(floor(t) + 5) - 0.5) * 6)
+    }
+    /// Prompt tokens read per second (a burst while the prompt is read, before the first token).
+    private func promptRate(_ t: Double) -> Double { (40.0..<46).contains(phase(t).x) ? 2050 : 0 }
+    private func gpuW(_ u: Double) -> Double { 0.6 + u * 0.56 }
+    private func mood(_ u: Double) -> String {
+        u < 5 ? "sleeping" : u < 30 ? "chill" : u < 70 ? "working" : u < 90 ? "hustling" : "turbo"
+    }
+    private func mem(_ t: Double) -> Double { ai(t) ? 61.5 + load(t) * 0.04 : 39 + load(t) * 0.05 }
+
+    private let model = "Qwen3-30B-A3B-4bit"
+    private let server = "MLX"
+    private let promptSize = 12_288.0
+
+    private var host: [String: Any] {
+        ["name": HostRecord.demoName, "hostname": "demo-mac.local", "model_name": "Mac Studio", "model_id": "Mac16,9",
+         "chip": "Apple M4 Max", "gpu_cores": 40, "cpu_cores": 16, "cpu_performance_cores": 12, "cpu_efficiency_cores": 4,
+         "memory_bytes": 68_719_476_736.0, "macos": "26.1", "addresses": [[String: Any]](), "gpud_version": "demo"]
+    }
+
+    /// Who uses the GPU at time t: (name, activity, share of the load, is AI, plain-English headline).
+    private func procs(_ t: Double) -> [(String, String, Double, Bool, String?)] {
+        let u = load(t)
+        var list: [(String, String, Double, Bool, String?)] = [
+            ("WindowServer", "Drawing your screen", min(u, 2.5 + hash(floor(t / 3)) * 2.5), false, nil),
+            ("GPU Buddy", "", min(u, 0.8), false, nil),
+        ]
+        if ai(t) {
+            let reading = promptRate(t) > 0
+            list.append(("mlx_lm.server", model, max(0, u - 4), true,
+                         reading ? "Reading a 12K-token prompt for Qwen3 30B" : "Writing an answer with Qwen3 30B"))
+        } else if u > 6 {
+            list.append(("mediaanalysisd", "Photos scanning your library", max(0, u - 4), false, nil))
+        }
+        return list.sorted { $0.2 > $1.2 }
+    }
+
+    /// Total tokens the demo LLM has written / read over the last 24 h, from the same hourly totals as the ledger.
+    private func last24h(_ now: Double) -> (Double, Double) {
+        let u = usageTotals(from: now - 86400, to: now, now: now)
+        return (u.gen, u.prompt)
+    }
+
+    func snapshot(_ t: Double) -> [String: Any] {
+        let u = load(t), n = phase(t).n, x = phase(t).x, on = ai(t)
+        let gen = genRate(t), prompt = promptRate(t)
+        let (gen24, prompt24) = last24h(t)
+        let start = n * Self.cycle + 40
+        let gw = gpuW(u)
+        let warm = (0..<5).map { load(t - Double($0) * 6) }.reduce(0, +) / 5  // the chip warms up and cools down slowly
+        let processes: [[String: Any]] = procs(t).enumerated().map { i, p in
+            var d: [String: Any] = ["pid": 400 + i * 117, "name": p.0, "gpu_percent": (p.2 * 10).rounded() / 10, "is_ai": p.3,
+                                    "activity": p.1]
+            if let e = p.4 {
+                d["explain"] = e
+                d["explain_icon"] = "🤖"
+                d["explain_facts"] = gen > 0 ? ["\(Int(gen)) tokens/s", "Qwen3 30B (4-bit, MLX)", "asked by Cline"]
+                                             : ["12K-token prompt", "Qwen3 30B (4-bit, MLX)", "asked by Cline"]
+                d["tok_s"] = gen
+            }
+            return d
+        }
+        let written = on && x >= 46 ? min(x - 46, 68) * 92 : 0
+        var active: [[String: Any]] = []
+        if on {
+            active.append(["id": "demo-\(Int(n))", "started": start, "agent": "Cline", "icon": "🤖", "who": "Cline in VS Code",
+                           "local": true, "model": model, "est_tokens": promptSize, "live_tokens": written, "server": server,
+                           "state": x < 46 ? "waiting" : "answering", "path": "/v1/chat/completions"])
+        }
+        let callers = [("Cline", "🤖", "Cline in VS Code"), ("Open WebUI", "💬", "Open WebUI"), ("curl", "⌨️", "curl in Terminal")]
+        let recent: [[String: Any]] = (1...4).map { k in
+            let m = n - Double(k), c = callers[abs(Int(m)) % 3]
+            return ["id": "demo-\(Int(m))", "started": m * Self.cycle + 40, "agent": c.0, "icon": c.1, "who": c.2, "local": true,
+                    "model": model, "prompt_tokens": (promptSize + hash(m) * 6000).rounded(), "output_tokens": (5600 + hash(m + 3) * 900).rounded(),
+                    "server": server, "ttft": 5.6 + hash(m + 1) * 1.2, "seconds": 74.0, "status": 200, "state": "done",
+                    "path": "/v1/chat/completions"]
+        }
+        var tokens: [String: Any] = [
+            "generated_per_s": gen, "prompt_per_s": prompt, "generated_24h": gen24, "prompt_24h": prompt24,
+            "speed_tok_s": gen > 0 ? gen : prompt, "ttft_s": 5.9, "ttft_avg_s": 6.2, "ttft_model": model,
+            "ttft_prompt_tokens": promptSize, "ttft_samples": 20,
+            "sources": [["name": server, "url": "demo", "model": model, "tok_s": gen, "in_flight": on ? 1 : 0,
+                         "generated_total": gen24, "prompt_total": prompt24, "ttft_s": 5.9, "ttft_avg_s": 6.2]],
+            "llms": [["server": server, "model": model, "in_flight": on ? 1 : 0, "tok_s": gen, "last_tok_s": 104.6,
+                      "last_tok_at": gen > 0 ? t : (x >= 114 ? n : n - 1) * Self.cycle + 114,
+                      "generated_24h": gen24 * 0.8, "prompt_24h": prompt24 * 0.8],
+                     ["server": "Ollama", "model": "qwen3:8b", "in_flight": 0, "tok_s": 0, "last_tok_s": 48.2,
+                      "last_tok_at": t - 3 * 3600, "generated_24h": gen24 * 0.2, "prompt_24h": prompt24 * 0.2]],
+        ]
+        if (40.0..<46).contains(x) { tokens["ttft_pending_since"] = start }
+        let cpu = 3.2 + (on ? 5.5 : 0), dram = 1.6 + u * 0.08, soc = gw + cpu + 0.3 + dram + 4.6
+        var power: [String: Any] = [
+            "available": true, "gpu_w": gw, "cpu_w": cpu, "ane_w": 0.3, "dram_w": dram, "other_w": 4.6, "soc_w": soc,
+            "system_w": soc + 19.8, "ai_w": on ? gw * 0.93 : 0, "gpu_peak_w": 56.4, "gpu_temp": 36 + warm * 0.3,
+            "gpu_wh_24h": 446.5, "ai_wh_24h": 161.2, "j_per_token_24h": 2.46,
+        ]
+        if gen > 0 {
+            power["j_per_token"] = gw * 0.93 / gen
+            power["tokens_per_wh"] = 3600 * gen / (gw * 0.93)
+        }
+        return [
+            "timestamp": t, "host": host,
+            "gpu": ["model": "Apple M4 Max", "cores": 40, "utilization_percent": Int(u.rounded()), "mood": mood(u)],
+            "memory": ["used_bytes": 68_719_476_736.0 * mem(t) / 100, "total_bytes": 68_719_476_736.0, "used_percent": mem(t)],
+            "processes": processes, "ai_active": on, "tokens": tokens, "power": power,
+            "llm_requests": ["on": true, "active": active, "recent": recent],
+            "fun": ["est_peak_tflops": 15.4, "est_current_tflops": 15.4 * u / 100, "est_ops_since_start": 2.1e18 + t * 1e6,
+                    "peak_utilization_percent": 99],
+        ]
+    }
+
+    // MARK: The timeline
+
+    func history(seconds: Double, points: Int, now: Double) -> [String: Any] {
+        let span = max(60, min(seconds, 7 * 86400)), n = max(10, min(points, 600))
+        let bucket = span / Double(n)
+        var samples: [[String: Any]] = []
+        var legend: [String: (Double, Double, Bool, Double)] = [:]  // seconds, load·seconds, is AI, last seen
+        var gpuJ = 0.0, aiJ = 0.0, peak = 0.0, gen = 0.0, prompt = 0.0
+        for i in 0..<n {
+            let t0 = now - span + Double(i) * bucket
+            let probes = (0..<4).map { t0 + bucket * (Double($0) + 0.5) / 4 }
+            let loads = probes.map(load)
+            let u = loads.reduce(0, +) / 4, w = gpuW(u)
+            let isAI = probes.contains(where: ai)
+            let g = probes.map(genRate).reduce(0, +) / 4 * bucket, p = probes.map(promptRate).reduce(0, +) / 4 * bucket
+            let top = procs(probes[3]).first!
+            let label = top.1.isEmpty ? top.0 : "\(top.0) (\(top.1))"
+            var l = legend[label] ?? (0, 0, top.3, 0)
+            l.0 += bucket; l.1 += u * bucket; l.3 = t0 + bucket
+            legend[label] = l
+            gpuJ += w * bucket; aiJ += isAI ? w * 0.93 * bucket : 0; peak = max(peak, gpuW(loads.max()!))
+            gen += g; prompt += p
+            samples.append(["t": t0 + bucket, "util": (u * 10).rounded() / 10, "max": Int(loads.max()!.rounded()),
+                            "mem": mem(probes[3]), "ai": isAI, "top": label, "tok_gen": g.rounded(), "tok_prompt": p.rounded(),
+                            "gpu_w": (w * 10).rounded() / 10])
+        }
+        return [
+            "start": now - span, "end": now, "bucket_seconds": bucket, "samples": samples,
+            "tokens": ["generated": gen.rounded(), "prompt": prompt.rounded()],
+            "energy": ["gpu_j": gpuJ, "ai_j": aiJ, "peak_gpu_w": peak],
+            "legend": legend.sorted { $0.value.0 > $1.value.0 }.map { k, v in
+                ["label": k, "seconds": Int(v.0), "avg_pct": (v.1 / max(v.0, 1) * 10).rounded() / 10, "is_ai": v.2, "last_t": v.3]
+            },
+        ]
+    }
+
+    // MARK: The ledger: about two months of made-up hourly token totals
+
+    /// The first hour the demo "recorded": midnight 60 days ago.
+    private func firstRecorded(_ now: Double) -> Double {
+        cal.startOfDay(for: Date(timeIntervalSince1970: now - 60 * 86400)).timeIntervalSince1970
+    }
+
+    /// Tokens written and read in the hour starting at h: busy afternoons and evenings, quiet nights and weekends.
+    private func hourTokens(_ h: Double) -> (gen: Double, prompt: Double) {
+        let d = Date(timeIntervalSince1970: h)
+        let hour = cal.component(.hour, from: d), weekend = cal.isDateInWeekend(d)
+        let shape: [Double] = [0.3, 0.1, 0, 0, 0, 0, 0, 0.05, 0.2, 0.5, 0.8, 0.9, 0.7, 0.8, 1, 1, 0.9, 0.8, 0.6, 0.7, 0.9, 1, 0.8, 0.5]
+        let day = floor(h / 86400)
+        let busy = shape[hour] * (weekend ? 0.45 : 1) * (0.45 + hash(day) * 1.1) * (0.6 + hash(h / 3600) * 0.8)
+        let gen = (busy * 9800).rounded()
+        return (gen, (gen * (38 + hash(h / 3600 + 7) * 20)).rounded())
+    }
+
+    /// Every recorded hour in [from, to), oldest first.
+    private func hours(from: Double, to: Double, now: Double) -> [Double] {
+        let first = firstRecorded(now)
+        let lo = max(from > 0 ? from : first, first), hi = min(to, now)
+        guard hi > lo else { return [] }
+        var h = cal.dateInterval(of: .hour, for: Date(timeIntervalSince1970: lo))!.start.timeIntervalSince1970
+        if h < lo { h += 3600 }
+        var out: [Double] = []
+        while h < hi { out.append(h); h += 3600 }
+        return out
+    }
+
+    private func usageTotals(from: Double, to: Double, now: Double) -> (gen: Double, prompt: Double, hours: Int) {
+        var g = 0.0, p = 0.0, n = 0
+        for h in hours(from: from, to: to, now: now) {
+            let x = hourTokens(h)
+            g += x.gen; p += x.prompt
+            if x.gen > 0 { n += 1 }
+        }
+        return (g, p, n)
+    }
+
+    func usage(from: Double, to: Double, group: String?, now: Double) -> [String: Any] {
+        let first = firstRecorded(now)
+        let start = from > 0 ? from : first
+        let span = to - start
+        let g = ["hour", "day", "month", "year"].contains(group ?? "") ? group!
+            : span <= 2 * 86400 ? "hour" : span <= 92 * 86400 ? "day" : "month"
+        let f = DateFormatter()
+        f.dateFormat = ["hour": "yyyy-MM-dd HH:00", "day": "yyyy-MM-dd", "month": "yyyy-MM", "year": "yyyy"][g]
+        var order: [String] = []
+        var buckets: [String: (t: Double, gen: Double, prompt: Double, hours: Double)] = [:]
+        var gen = 0.0, prompt = 0.0, active = 0
+        for h in hours(from: start, to: to, now: now) {
+            let x = hourTokens(h)
+            gen += x.gen; prompt += x.prompt
+            if x.gen > 0 { active += 1 }
+            let k = f.string(from: Date(timeIntervalSince1970: h))
+            if buckets[k] == nil { order.append(k); buckets[k] = (h, 0, 0, 0) }
+            buckets[k]!.gen += x.gen; buckets[k]!.prompt += x.prompt; buckets[k]!.hours += 1
+        }
+        let idleJ = 0.8 * 3600.0, jPerToken = 2.46
+        let series: [[String: Any]] = order.map { k in
+            let b = buckets[k]!, ai = b.gen * jPerToken
+            return ["key": k, "t": b.t, "generated": b.gen, "prompt": b.prompt, "gpu_j": ai / 0.93 + idleJ * b.hours, "ai_j": ai]
+        }
+        let measured = Double(hours(from: start, to: to, now: now).count) * 3600
+        let aiJ = gen * jPerToken, gpuJ = aiJ / 0.93 + 0.8 * measured
+        let split: [(String, String, Double, Double)] = [
+            (server, model, 0.72, 2.31), ("Ollama", "qwen3:8b", 0.2, 0.34), (server, "Qwen3-VL-8B-Instruct-4bit", 0.08, 2.18),
+        ]
+        return [
+            "from": start, "to": to, "group": g, "first_recorded": first, "generated": gen, "prompt": prompt,
+            "total": gen + prompt, "active_hours": active, "series": series,
+            "models": split.filter { gen > 0 || $0.2 > 0.5 }.map { s, m, share, j in
+                ["server": s, "model": m, "generated": (gen * share).rounded(), "prompt": (prompt * share).rounded(),
+                 "energy_j": gen * share * j, "j_per_token": j]
+            },
+            "energy": ["gpu_j": gpuJ, "soc_j": gpuJ * 1.9, "system_j": gpuJ * 1.9 + 19.8 * measured, "ai_j": aiJ,
+                       "measured_seconds": measured, "j_per_token": gen > 0 ? aiJ / gen : 0],
+        ]
+    }
+
+    func summary(weekStart: Int, now: Double) -> [String: Any] {
+        var c = cal
+        c.firstWeekday = min(max(weekStart, 1), 7)
+        let d = Date(timeIntervalSince1970: now)
+        func totals(_ from: Date?) -> [String: Any] {
+            let u = usageTotals(from: from?.timeIntervalSince1970 ?? 0, to: now + 1, now: now)
+            return ["generated": u.gen, "prompt": u.prompt, "total": u.gen + u.prompt]
+        }
+        return [
+            "today": totals(c.startOfDay(for: d)), "week": totals(c.dateInterval(of: .weekOfYear, for: d)?.start),
+            "month": totals(c.dateInterval(of: .month, for: d)?.start), "ytd": totals(c.dateInterval(of: .year, for: d)?.start),
+            "total": totals(nil), "first_recorded": firstRecorded(now),
+        ]
+    }
+
+    /// A handful of the cloud prices gpud ships with (USD per 1M tokens: input, cache read, cache write, output, batch).
+    private static let prices: [(String, String, Double, Double, Double, Double, Double, String)] = [
+        ("Anthropic", "Claude Opus 5.5", 4, 0.2, 5, 20, 0.5, "us"),
+        ("OpenAI", "GPT-5.5", 5, 0.5, 5, 30, 0.5, "us"),
+        ("Google", "Gemini 3.1 Pro", 2, 0.2, 2, 12, 0.5, "us"),
+        ("Anthropic", "Claude Sonnet 5.5", 2, 0.1, 2.5, 10, 0.5, "us"),
+        ("Alibaba", "Qwen3.8 Max", 2, 0.2, 2, 6, 1, "cn"),
+        ("DeepSeek", "DeepSeek V4 Pro", 1.32, 0.044, 1.32, 3.96, 1, "cn"),
+        ("Google", "Gemini 3.8 Flash", 0.75, 0.075, 0.75, 3.75, 0.5, "us"),
+        ("Anthropic", "Claude Haiku 5.5", 0.1, 0.01, 0.125, 0.5, 0.5, "us"),
+    ]
+
+    func cost(from: Double, to: Double, cacheHit: Double, thinking: Double, tokenizer: Double, batch: Bool, now: Double) -> [String: Any] {
+        let first = firstRecorded(now), start = max(from > 0 ? from : first, first)
+        let u = usageTotals(from: start, to: to, now: now)
+        let p = u.prompt * tokenizer, g = u.gen * tokenizer * (1 + thinking)
+        let cached = p * cacheHit, written = cached / 10, uncached = p - cached
+        let days = max((min(to, now) - start) / 86400, 1 / 24)
+        let rows: [[String: Any]] = Self.prices.map { pr in
+            var c = (uncached * pr.2 + (cached - written) * pr.3 + written * pr.4 + g * pr.5) / 1e6
+            if batch { c *= pr.6 }
+            return ["provider": pr.0, "model": pr.1, "cost": c, "per_day": c / days, "per_month": c / days * 30,
+                    "input": pr.2, "cache_read": pr.3, "output": pr.5, "region": pr.7]
+        }.sorted { ($0["cost"] as! Double) > ($1["cost"] as! Double) }
+        let hrs = Double(hours(from: start, to: to, now: now).count)
+        let chip = (u.gen * 2.46 / 0.93 + 0.8 * hrs * 3600) * 1.9
+        return [
+            "as_of": "demo", "sources": [String](), "days": days, "models": rows,
+            "local": ["chip_j": chip, "system_j": chip + 19.8 * hrs * 3600, "measured_hours": hrs, "period_hours": hrs,
+                      "system_overhead_w": 19.8],
+        ]
     }
 }
 
@@ -2906,8 +3346,13 @@ struct ContentView: View {
     }
 
     private var badge: String? {
+        let ai = store.online && (store.shown?.ai_active ?? false)
+        if store.host.isDemo {  // never mistaken for a real Mac
+            if let t = store.scrubTime { return "DEMO · ⏪ \(clockText(t))" }
+            return ai ? "DEMO · 🧠 AI at work" : "DEMO · sample data"
+        }
         if let t = store.scrubTime { return "⏪ \(clockText(t))" }
-        return store.online && (store.shown?.ai_active ?? false) ? "🧠 AI at work" : nil
+        return ai ? "🧠 AI at work" : nil
     }
 
     private var moodColor: Color { Color(hue: anim.hue, saturation: 0.45, brightness: 1) }
@@ -3010,6 +3455,10 @@ struct ContentView: View {
 
             VStack(spacing: 8) {
                 HostBar(fleet: fleet)
+                // Nothing to show yet (no Mac paired, or this Mac's gpud isn't running): offer the demo.
+                if store.host.isLocal, !store.online, !Fleet.hasLocal || store.problem != nil {
+                    TryDemoCard(fleet: fleet)
+                }
 
                 FoldSection(fleet: fleet, id: "gpu", title: "GPU",
                             summary: store.online ? "\(s?.gpu.utilization_percent ?? 0)% · \(moodLabel[store.mood] ?? "")" : "--") {
@@ -3783,7 +4232,8 @@ struct HostChip: View {
         Button(action: action) {
             HStack(spacing: 4) {
                 Circle().fill(store.online ? Color.green : Color.red.opacity(0.7)).frame(width: 6, height: 6)
-                Text(store.host.title).lineLimit(1).frame(maxWidth: 90)
+                Text(store.host.isDemo ? store.host.name : store.host.title).lineLimit(1).frame(maxWidth: 90)
+                if store.host.isDemo { DemoTag() }
                 if store.online {
                     Text("\(store.snap?.gpu.utilization_percent ?? 0)%").monospacedDigit().opacity(0.75)
                 }
@@ -3801,7 +4251,9 @@ struct HostChip: View {
 /// Name, hardware, network and connection of one Mac, for tooltips.
 @MainActor func hostTooltip(_ store: GPUStore) -> String {
     var lines = [store.snap?.host?.details ?? store.host.name]
-    if store.host.isLocal {
+    if store.host.isDemo {
+        lines = ["Demo Mac: sample data built into GPU Buddy, not a real Mac. Pair a Mac in Macs to see yours."]
+    } else if store.host.isLocal {
         lines.append("This Mac, over 127.0.0.1")
     } else {
         lines.append("Connected to \(store.host.address) · 🔒 TLS, certificate pinned"
@@ -3836,6 +4288,19 @@ struct MacsView: View {
                     note("No Macs yet. Pair one below: on the Mac, open GPU Buddy → Macs and copy its pairing code.")
                 }
                 ForEach(fleet.watched, id: \.host.id) { s in PairedRow(store: s, fleet: fleet) }
+                if fleet.demo == nil {
+                    HStack(spacing: 6) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 5) {
+                                Text("Demo Mac").font(.system(size: 12, weight: .bold, design: .rounded))
+                                DemoTag()
+                            }
+                            note("See what GPU Buddy shows with sample data. No Mac needed.")
+                        }
+                        Spacer()
+                        pill("Try it") { fleet.showDemo() }
+                    }
+                }
             }
 
             section("ON YOUR NETWORK") {
@@ -3962,6 +4427,47 @@ struct MacsView: View {
     }
 }
 
+/// The little "DEMO" label next to the Demo Mac, wherever it's listed.
+struct DemoTag: View {
+    var body: some View {
+        Text("DEMO").font(.system(size: 7.5, weight: .black, design: .rounded)).foregroundColor(.black)
+            .padding(.horizontal, 4).padding(.vertical, 1.5)
+            .background(Capsule().fill(Color(red: 0.55, green: 0.85, blue: 1)))
+            .fixedSize()
+    }
+}
+
+/// On the empty Live screen: try the Demo Mac, or go pair a real one.
+struct TryDemoCard: View {
+    @ObservedObject var fleet: Fleet
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Text("No Mac to show yet").font(.system(size: 12, weight: .heavy, design: .rounded))
+            Text("Try the Demo Mac to see GPU Buddy at work with sample data, or pair a Mac running gpud.")
+                .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.6))
+                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button { fleet.showDemo() } label: {
+                    Text("▶︎ Try the demo").font(.system(size: 11, weight: .heavy, design: .rounded))
+                        .padding(.horizontal, 12).frame(height: 26)
+                        .background(Capsule().fill(Color(red: 1, green: 0.85, blue: 0.5))).foregroundColor(.black)
+                }
+                .buttonStyle(.plain)
+                Button { fleet.onOpenMacs?() } label: {
+                    Text("Pair a Mac").font(.system(size: 11, weight: .heavy, design: .rounded))
+                        .padding(.horizontal, 12).frame(height: 26)
+                        .background(Capsule().fill(.white.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity)
+        .background(RoundedRectangle(cornerRadius: 12).fill(.white.opacity(0.06)))
+    }
+}
+
 struct PairedRow: View {
     @ObservedObject var store: GPUStore
     @ObservedObject var fleet: Fleet
@@ -3973,6 +4479,7 @@ struct PairedRow: View {
                 HStack(spacing: 5) {
                     Text(store.host.isLocal ? "This Mac" : store.host.name).font(.system(size: 12, weight: .bold, design: .rounded))
                         .foregroundColor(.white)
+                    if store.host.isDemo { DemoTag() }
                     if store.host.isLocal, let n = store.snap?.host?.name {
                         Text(n).font(.system(size: 10, weight: .semibold, design: .rounded)).foregroundColor(.white.opacity(0.5))
                     }
@@ -3981,6 +4488,12 @@ struct PairedRow: View {
                             .monospacedDigit().foregroundColor(Color(red: 1, green: 0.85, blue: 0.5))
                     }
                 }
+                if store.host.isDemo {
+                    Text("Sample data built into the app, shaped like a Mac Studio running local AI.")
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true).foregroundColor(.white.opacity(0.65))
+                    Text("Not a real Mac · no network · pair a Mac below to see yours")
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                } else {
                 if let h = store.snap?.host {
                     Text("\(h.hardware) · macOS \(h.macos)").lineLimit(1).minimumScaleFactor(0.8)
                         .foregroundColor(.white.opacity(0.65))
@@ -3991,6 +4504,7 @@ struct PairedRow: View {
                         + (store.latency.map { String(format: " · %.0f ms", $0) } ?? ""))
                      : "⚠️ " + (store.problem ?? "connecting…"))
                     .lineLimit(1)
+                }
             }
             .font(.system(size: 9.5, weight: .medium, design: .rounded)).foregroundColor(.white.opacity(0.5))
             .help(hostTooltip(store))
@@ -4001,7 +4515,8 @@ struct PairedRow: View {
             }
             if !store.host.isLocal {
                 Button { fleet.remove(store.host.id) } label: { Image(systemName: "trash").font(.system(size: 10)) }
-                    .buttonStyle(.plain).foregroundColor(.white.opacity(0.5)).help("Forget this Mac")
+                    .buttonStyle(.plain).foregroundColor(.white.opacity(0.5))
+                    .help(store.host.isDemo ? "Remove the Demo Mac (you can add it back here)" : "Forget this Mac")
             }
         }
     }
