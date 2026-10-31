@@ -3341,7 +3341,9 @@ struct SettingsView: View {
 
                     Toggle("Batch API (50% off, results within 24h)", isOn: $batch)
                         .font(.system(size: 11, weight: .medium, design: .rounded))
+                        #if os(macOS)
                         .toggleStyle(.checkbox)
+                        #endif
 
                     Picker("Region", selection: $region) {
                         Text("All models").tag("all")
