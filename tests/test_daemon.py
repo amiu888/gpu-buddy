@@ -83,5 +83,36 @@ class PublicSnapshot(unittest.TestCase):
         self.assertNotIn("explain_quote", out)
 
 
+class KapitsaModelSwitch(unittest.TestCase):
+    SCRIPT = ("#!/bin/zsh\n# keeps --model-id as before\nexec kapitsa serve \\\n  --model /Users/me/My Models/x/model \\\n"
+              "  --dflash /Users/me/x/dflash2 \\\n  --model-id /Users/me/x/model \\\n  --port 8081\n")
+
+    def test_reads_and_rewrites_only_the_model_lines(self):
+        import llmproxy
+        src = self.SCRIPT.replace("My Models", "MyModels")
+        self.assertEqual(llmproxy._read_flags(src), {"model": "/Users/me/MyModels/x/model",
+                                                     "dflash": "/Users/me/x/dflash2", "model_id": "/Users/me/x/model"})
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "start.sh")
+            with open(f, "w") as fh:
+                fh.write(src)
+            setup = {"file": f, "kind": "script", "plist": None, "label": "x"}
+            with mock.patch.object(llmproxy, "BACKUPS", os.path.join(d, "b")), mock.patch.object(llmproxy, "_restart") as r:
+                llmproxy.set_kapitsa_args(setup, {"model": "qwen3.8-27b:4bit", "dflash": "auto", "model_id": None})
+                r.assert_called_once()
+            with open(f) as fh:
+                out = fh.read()
+            self.assertEqual(llmproxy._read_flags(out), {"model": "qwen3.8-27b:4bit", "dflash": "auto",
+                                                         "model_id": "/Users/me/x/model"})
+            self.assertIn("# keeps --model-id as before", out)
+            self.assertIn("--port 8081", out)
+            self.assertEqual(len(os.listdir(os.path.join(d, "b"))), 1)  # the backup
+
+    def test_paths_with_spaces_are_quoted(self):
+        import llmproxy
+        out = llmproxy._flag_re("--model").sub(lambda m: m.group(1) + llmproxy.shlex.quote("/a b/model"), "--model x", count=1)
+        self.assertEqual(llmproxy._read_flags(out)["model"], "/a b/model")
+
+
 if __name__ == "__main__":
     unittest.main()
