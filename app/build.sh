@@ -4,6 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 APP="GPU Buddy.app"
 VERSION="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' ../daemon/gpud.py)"
+# CFBundleVersion: each TestFlight/App Store upload needs a new, higher build number.
+BUILD="${GPUBUDDY_BUILD_NUMBER:-$VERSION}"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/daemon"
 swiftc -O -swift-version 5 -target arm64-apple-macos14.0 -o "$APP/Contents/MacOS/GPUBuddy" GPUBuddy.swift mac/main.swift mac/Router.swift \
@@ -36,7 +38,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHighResolutionCapable</key><true/>

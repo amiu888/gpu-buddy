@@ -7,9 +7,24 @@ Meet **Chippy**, a kitty-eared chip who runs as hard as your GPU does.
 
 ## Download
 
-Get the DMG from [Releases](https://github.com/amiu888/gpu-buddy/releases/latest), drag GPU Buddy into Applications, and open it. It offers to install its background service. The build isn't notarized, so the first time use **System Settings → Privacy & Security → Open Anyway**. Requires an Apple Silicon Mac with macOS 14 or later.
+Get the DMG from [Releases](https://github.com/amiu888/gpu-buddy/releases/latest), drag GPU Buddy into Applications, and open it. It offers to install its background service. Release DMGs are signed with Developer ID and notarized by Apple, so they open without Gatekeeper warnings. Requires an Apple Silicon Mac with macOS 14 or later.
 
-To make a DMG yourself, run `./release.sh`. It writes `dist/GPU-Buddy-<version>.dmg`.
+To make a DMG yourself, run `./release.sh`. It writes `dist/GPU-Buddy-<version>.dmg`. Without signing settings it's only ad-hoc signed, so the first time use **System Settings → Privacy & Security → Open Anyway**.
+
+## Releasing
+
+1. Bump `VERSION` in `daemon/gpud.py` (the apps and the DMG read it from there) and write `dist/notes-<version>.md`.
+2. Run the checks: `python3 -m unittest discover -s tests`, then `./app/build.sh` and try the app.
+3. Sign, notarize and publish, with your own keychain (nothing secret lives in this repo):
+
+   ```bash
+   export GPUBUDDY_SIGN_IDENTITY="Developer ID Application: …"   # security find-identity -v -p codesigning
+   export GPUBUDDY_NOTARY_PROFILE=gpubuddy                         # once: xcrun notarytool store-credentials gpubuddy …
+   ./release.sh            # signed, notarized and stapled DMG, plus its SHA-256
+   ./release.sh --publish  # the same, then a GitHub release v<version> (refuses an existing tag)
+   ```
+
+`GPUBUDDY_BUILD_NUMBER` sets `CFBundleVersion` for `app/build.sh` and `app/build-ios.sh` (TestFlight needs a higher build number for every upload).
 
 ## iPhone and iPad
 
@@ -147,7 +162,7 @@ How it estimates:
 - **Tokenizer**: scales all counts, because each model family turns the same text into a different number of tokens.
 - **Batch API**: 50% off, for work nobody waits on.
 
-Prices are in `daemon/prices.json` with their date and sources. To change them, copy that file to `~/Library/Application Support/GPUBuddy/prices.json` and edit the copy. The API is `GET /api/v1/cost?preset=month&cache_hit=0.5&batch=1`.
+Prices are in `daemon/prices.json` with their date and sources. To change them, copy that file to `~/Library/Application Support/GPUBuddy/prices.json` and edit the copy. Your copy is used until an update ships prices with a newer `as_of` date; set `as_of` in your copy to the day you edited it to keep your edits. gpud keeps a dated copy of the price table in `prices_history/` whenever it changes (`GET /api/v1/prices/history`). The API is `GET /api/v1/cost?preset=month&cache_hit=0.5&batch=1`.
 
 ## Watching other Macs
 

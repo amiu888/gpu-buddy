@@ -27,6 +27,7 @@ Security:
 """
 
 import collections
+import functools
 import hashlib
 import hmac
 import http.client
@@ -35,6 +36,7 @@ import os
 import plistlib
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -54,7 +56,9 @@ DEFAULTS = {"enabled": False, "listen_port": 8080, "upstream_port": 8081, "allow
             "keys": [],              # client keys: {"id", "name", "key", "routes": ["*"] or route ids, "created", "last_used"}
             "require_key": False,    # other devices need a key even when on the allow list
             "server_names": {},      # server id -> the name the user gave it
-            "manual_servers": []}    # servers GPU Buddy can't find by itself: {"host", "port", "name"}
+            "manual_servers": [],    # servers GPU Buddy can't find by itself: {"host", "port", "name"}
+            "hidden_servers": [],    # server ids the user removed from the list while they were running
+            "kapitsa_original": {}}  # Kapitsa start file -> its model settings before GPU Buddy first switched them
 
 # Ports LLM servers often use, checked even when the program's name gives nothing away.
 KNOWN_PORTS = (8000, 8001, 8080, 8081, 8082, 8083, 1234, 11434, 11435, 5000, 5001, 1337, 4891, 30000, 52415, 8888, 9000)
@@ -282,6 +286,7 @@ class LLMProxy:
         self.recent = collections.deque(maxlen=200)
         self.totals = {}  # server port -> {"prompt", "gen", "gen_seen"}: tokens since gpud started, for counters()
         self.local_ips = _Lookup.local_addresses()
+        self.kapitsa_switch = {}  # server id -> {"to", "label", "started", "download_gb"} while Kapitsa changes model
         self._busy = threading.Lock()  # one turn on / off at a time
         self._load_recent()
         threading.Thread(target=self._discover_loop, daemon=True).start()
@@ -329,7 +334,9 @@ class LLMProxy:
                     "retention_days": c["retention_days"],
                     "moved": c["moved"] and {"file": c["moved"]["file"], "backup": c["moved"]["backup"]},
                     "log_file": LOG, "addresses": addrs, "routes": routes, "keys": keys,
-                    "servers": sorted(self.servers.values(), key=lambda s: (not s["up"], s["port"])),
+                    "servers": sorted((self._with_choices(s) for s in self.servers.values()),
+                                      key=lambda s: (not s["up"], s["port"])),
+                    "hidden_servers": c["hidden_servers"],
                     "clients": self._clients()}
 
     def configure(self, change):
@@ -385,17 +392,36 @@ class LLMProxy:
                     self.servers[sid]["name"] = name or self.servers[sid]["kind_name"]
             if "add_server" in change:
                 a = change["add_server"]
-                port = int(a.get("port") or 0)
-                host = str(a.get("host") or "127.0.0.1").strip()
-                if not 1 <= port <= 65535 or not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", host):
-                    raise ValueError("give a host and a port, like 127.0.0.1 and 8000")
+                host, port = parse_address(a.get("address") or f"{a.get('host') or '127.0.0.1'}:{a.get('port') or 0}")
                 c["manual_servers"] = [m for m in c["manual_servers"] if (m["host"], m["port"]) != (host, port)] + \
                     [{"host": host, "port": port, "name": str(a.get("name") or "").strip()[:40]}]
-            if "remove_server" in change:
+                c["hidden_servers"] = [h for h in c["hidden_servers"] if h != f"{host}:{port}"]
+            if "remove_server" in change:  # from the list; a running server found by itself stays hidden until added again
                 sid = str(change["remove_server"])
+                for r in c["routes"]:
+                    if sid in (r["target"], r.get("default")):
+                        raise ValueError(f"the entry port “{r['name']}” sends requests to this server; pick another "
+                                         f"server for it first")
                 c["manual_servers"] = [m for m in c["manual_servers"] if f"{m['host']}:{m['port']}" != sid]
+                if sid in self.servers and self.servers[sid].get("up") and not self.servers[sid].get("manual"):
+                    c["hidden_servers"] = sorted(set(c["hidden_servers"]) | {sid})
                 self.servers.pop(sid, None)
+                self.kapitsa_switch.pop(sid, None)
             self._save()
+        if "probe_server" in change:  # "is there an LLM server here?", before adding it
+            host, port = parse_address(change["probe_server"])
+            rec = _probe_server(host, port, None, "", [])
+            found = {"host": host, "port": port, "ok": bool(rec)}
+            if rec:
+                found.update(kind_name=rec["kind_name"], icon=rec["icon"], models=rec["models"][:20],
+                             model_count=len(rec["models"]))
+            else:
+                found["error"] = (f"Nothing at {host}:{port} answered GET /v1/models. Check the address, that the server "
+                                  f"is running, and that it listens on the network (not only 127.0.0.1 on that computer).")
+            return dict(self.status(), probe=found)
+        if "kapitsa_model" in change:
+            km = change["kapitsa_model"] or {}
+            self.switch_kapitsa(str(km.get("server") or ""), str(km.get("model") or ""))
         if "add_server" in change:
             threading.Thread(target=self.discover, daemon=True).start()
         if routes_changed and self.state == "on":
@@ -464,6 +490,83 @@ class LLMProxy:
                 return r
         return None
 
+    # ---- Kapitsa: picking the model it serves
+
+    def _original(self, setup):
+        """Kapitsa's model settings from before GPU Buddy first switched them (else the current ones)."""
+        return self.cfg["kapitsa_original"].get(setup["file"]) or setup["args"]
+
+    def _with_choices(self, s):
+        """A server for the app: without internal fields, plus Kapitsa's model choices and switch progress."""
+        out = {k: v for k, v in s.items() if not k.startswith("_")}
+        setup = s.get("_setup")
+        if s.get("kind") != "kapitsa" or not setup or not s.get("_catalog"):
+            return out
+        cur, orig = setup["args"], self._original(setup)
+        sizes, ram = kapitsa_sizes(s.get("_binary")), _ram_gb()
+        on_disk = orig.get("model") and orig["model"].startswith("/")
+        choices = [{"id": "original", "name": _short_model(orig.get("model_id") or orig["model"]) + " (your setup)",
+                    "about": f"The model your start script ran before: {orig['model']}", "size_gb": None,
+                    "downloaded": not on_disk or os.path.isdir(orig["model"]), "fits": True,
+                    "active": cur.get("model") == orig.get("model")}]
+        for m in s["_catalog"]:  # the catalog lists each model's default variant, whose size `kapitsa --help` gives
+            gb = sizes.get(m["id"].split(":")[0])
+            choices.append(dict(m, size_gb=gb, fits=gb is None or gb <= _fit_gb(ram),
+                                active=cur.get("model") in (m["id"], m["id"].split(":")[0]) and cur.get("model") != orig.get("model")))
+        out["choices"] = choices
+        out["start_file"] = setup["file"]
+        sw = self.kapitsa_switch.get(s["id"])
+        if sw:
+            if s["up"] and s.get("pid") != sw["old_pid"]:  # a new Kapitsa answers: it has loaded the model
+                self.kapitsa_switch.pop(s["id"], None)
+            else:
+                out["switching"] = {"to": sw["label"], "seconds": int(_now() - sw["started"]),
+                                    "download_gb": sw.get("download_gb"), "last_line": _last_line(setup.get("log"))}
+        return out
+
+    def switch_kapitsa(self, sid, model):
+        """Make the Kapitsa server `sid` run `model` (a catalog id like "qwen3.8-27b:4bit", or "original"): edits the
+        --model line (and --dflash / --model-id) of its start script or LaunchAgent, after a backup, and restarts it.
+        Kapitsa downloads a model it doesn't have yet, so this can take a while; the app shows "switching"."""
+        with self.lock:
+            s = self.servers.get(sid)
+        if not s or s.get("kind") != "kapitsa":
+            raise ValueError("that isn't a Kapitsa server GPU Buddy knows")
+        setup = kapitsa_setup(s["port"])
+        if not setup:
+            raise ValueError(f"GPU Buddy can't find the LaunchAgent that starts Kapitsa on port {s['port']}, so it can't "
+                             f"change its model. Start Kapitsa from a LaunchAgent (a script with --model and --port).")
+        cur = setup["args"]
+        with self.lock:
+            if setup["file"] not in self.cfg["kapitsa_original"]:
+                self.cfg["kapitsa_original"] = dict(self.cfg["kapitsa_original"], **{setup["file"]: dict(cur)})
+                self._save()
+            orig = self._original(setup)
+        choice = next((c for c in self._with_choices(dict(s, _setup=setup)).get("choices", []) if c["id"] == model), None)
+        if choice is None:
+            raise ValueError(f"Kapitsa doesn't offer “{model}”")
+        if choice["active"]:
+            raise ValueError(f"Kapitsa already runs {choice['name']}")
+        if not choice["fits"]:
+            raise ValueError(f"{choice['name']} needs about {choice['size_gb']:.0f} GB, too much for this Mac's "
+                             f"{_ram_gb():.0f} GB of memory")
+        download = None if choice["downloaded"] else choice.get("size_gb")
+        if download and shutil.disk_usage(os.path.expanduser("~")).free < (download + 20) * 1024 ** 3:
+            raise ValueError(f"{choice['name']} is a {download:.0f} GB download; free up some disk space first "
+                             f"(GPU Buddy keeps 20 GB free)")
+        if model == "original":
+            new = dict(orig)
+        else:  # Kapitsa's own files: its default drafter, and the catalog name in the API
+            new = {"model": model, "dflash": "auto" if cur.get("dflash") else None,
+                   "model_id": model if cur.get("model_id") else None}
+        set_kapitsa_args(setup, new)
+        with self.lock:
+            self.kapitsa_switch[sid] = {"to": model, "label": choice["name"], "started": _now(), "download_gb": download,
+                                        "old_pid": s.get("pid")}
+            s["up"] = False  # until discovery sees the new process answer
+        threading.Thread(target=self.discover, daemon=True).start()
+        print(f"gpud: LLM router: Kapitsa on port {s['port']} now starts {new['model']}", flush=True)
+
     # ---- turning on and off
 
     def _start(self):
@@ -475,8 +578,11 @@ class LLMProxy:
                 self.state, self.message = "starting", None
             # The first entry port may be where an LLM server already listens (8080): that server moves to 8081.
             port, up = c["routes"][0]["port"], c["upstream_port"]
-            if _port_open(port) and not c["moved"] and not self.listeners:
-                job = find_server_job(port)
+            # A LaunchAgent set to start a server on the port counts even when nothing answers there yet: right after
+            # turning off, the server is still restarting (loading a big model takes a minute) and would take the
+            # port back from us once loaded.
+            job = find_server_job(port) if not c["moved"] and not self.listeners else None
+            if (job or _port_open(port)) and not c["moved"] and not self.listeners:
                 if job is None:
                     return self._fail(f"Port {port} is in use by a program GPU Buddy doesn't know how to move. Start your "
                                       f"LLM server on port {up}, for this Mac only (host 127.0.0.1), then try again.")
@@ -725,6 +831,8 @@ class LLMProxy:
                 continue  # Ollama's own helper for a loaded model (random port): reached through Ollama, not directly
                 continue
             low = args.lower()
+            if f"127.0.0.1:{port}" in self.cfg["hidden_servers"]:
+                continue
             if port in KNOWN_PORTS or any(w in low for w in LLM_WORDS):
                 cands[f"127.0.0.1:{port}"] = ("127.0.0.1", port, pid, args, addrs)
         for m in self.cfg["manual_servers"]:
@@ -739,6 +847,9 @@ class LLMProxy:
             t.start()
         for t in threads:
             t.join(25)
+        for rec in found.values():
+            if rec and rec["kind"] == "kapitsa" and rec["host"] in ("127.0.0.1", "localhost"):
+                rec["_setup"] = kapitsa_setup(rec["port"])
         now = _now()
         manual = {f"{m['host']}:{m['port']}": m for m in self.cfg["manual_servers"]}
         targets = {r["target"] for r in self.cfg["routes"]} | {r.get("default") for r in self.cfg["routes"]}
@@ -1172,9 +1283,15 @@ def _probe_server(host, port, pid, args, addrs):
     if kind == "ollama" and port != 11434:
         kind_name = f"Ollama :{port}"
     prog = os.path.basename(args.split()[0]) if args else None
-    return {"host": host, "port": port, "kind": kind, "kind_name": kind_name, "icon": icon, "process": prog,
-            "pid": pid, "models": models[:300], "any_model": kind == "kapitsa", "up": True,
-            "network": any(a in ("*", "0.0.0.0", "::") for a in addrs)}
+    rec = {"host": host, "port": port, "kind": kind, "kind_name": kind_name, "icon": icon, "process": prog,
+           "pid": pid, "models": models[:300], "any_model": kind == "kapitsa", "up": True,
+           "network": any(a in ("*", "0.0.0.0", "::") for a in addrs)}
+    if kind == "kapitsa":  # its catalog: the models it can switch to (see LLMProxy.switch_kapitsa)
+        rec["_catalog"] = [{"id": m["id"], "name": m.get("display_name") or m["id"], "about": m.get("about") or "",
+                            "downloaded": bool(m.get("downloaded"))}
+                           for m in rows if m.get("short_name") and m.get("display_name")]
+        rec["_binary"] = args.split()[0] if args else None
+    return rec
 
 
 def _addresses(local_ips):
@@ -1358,3 +1475,159 @@ def restore_server(moved):
                 f"(the original is saved at {moved['backup']}).")
     _restart(moved, moved["kind"] == "plist")
     return note
+
+
+# ---- Kapitsa's model: read and change the --model line of the LaunchAgent that starts it
+
+KAPITSA_FLAGS = (("model", "--model"), ("dflash", "--dflash"), ("model_id", "--model-id"))
+_kapitsa_help = {}
+
+
+def _flag_re(flag):
+    """`--model VALUE` or `--model=VALUE` (not --model-id), VALUE quoted or not."""
+    return re.compile(r"(%s(?:[ \t]+|=))(\"[^\"\n]*\"|'[^'\n]*'|[^\s\\\"']+)" % re.escape(flag))
+
+
+def _find_flag(text, flag):
+    """The first `flag VALUE` outside a # comment."""
+    for m in _flag_re(flag).finditer(text):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        if "#" not in text[line_start:m.start()]:
+            return m
+    return None
+
+
+def _job_args(setup):
+    """The start script's text, or the LaunchAgent's ProgramArguments."""
+    if setup["kind"] == "plist":
+        with open(setup["file"], "rb") as f:
+            return [str(a) for a in plistlib.load(f).get("ProgramArguments", [])]
+    with open(setup["file"], encoding="utf-8") as f:
+        return f.read()
+
+
+def _read_flags(src):
+    out = {}
+    for key, flag in KAPITSA_FLAGS:
+        if isinstance(src, list):
+            for i, a in enumerate(src):
+                if a == flag and i + 1 < len(src):
+                    out[key] = src[i + 1]
+                elif a.startswith(flag + "="):
+                    out[key] = a[len(flag) + 1:]
+        else:
+            m = _find_flag(src, flag)
+            if m:
+                out[key] = m.group(2).strip("'\"")
+    return out
+
+
+def kapitsa_setup(port):
+    """How Kapitsa on `port` is started: the LaunchAgent, the file holding its arguments, the model arguments in it,
+    and its log. None when GPU Buddy can't find exactly one such LaunchAgent."""
+    job = find_server_job(port)
+    if not job:
+        return None
+    try:
+        args = _read_flags(_job_args(job))
+        with open(job["plist"], "rb") as f:
+            p = plistlib.load(f)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not args.get("model"):
+        return None
+    return dict(job, args=args, log=p.get("StandardErrorPath") or p.get("StandardOutPath"))
+
+
+def set_kapitsa_args(setup, new):
+    """Write the model arguments (None: leave that one as it is) after saving a backup, and restart Kapitsa."""
+    os.makedirs(BACKUPS, exist_ok=True)
+    os.chmod(BACKUPS, 0o700)
+    shutil.copy2(setup["file"], os.path.join(BACKUPS, f"{os.path.basename(setup['file'])}.{time.strftime('%Y%m%d-%H%M%S')}"))
+    src = _job_args(setup)
+    for key, flag in KAPITSA_FLAGS:
+        val = new.get(key)
+        if val is None:
+            continue
+        if isinstance(src, list):
+            for i, a in enumerate(src):
+                if a == flag and i + 1 < len(src):
+                    src[i + 1] = val
+                elif a.startswith(flag + "="):
+                    src[i] = f"{flag}={val}"
+        else:
+            m = _find_flag(src, flag)
+            if m:
+                src = src[:m.start(2)] + shlex.quote(val) + src[m.end(2):]
+    if setup["kind"] == "plist":
+        with open(setup["file"], "rb") as f:
+            d = plistlib.load(f)
+        d["ProgramArguments"] = src
+        with open(setup["file"], "wb") as f:
+            plistlib.dump(d, f)
+    else:
+        tmp = setup["file"] + ".gpubuddy-tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(src)
+        shutil.copymode(setup["file"], tmp)
+        os.replace(tmp, setup["file"])
+    _restart(setup, setup["kind"] == "plist")
+
+
+def kapitsa_sizes(binary):
+    """Download size in GB of each catalog model's default variant, from `kapitsa --help` (read once)."""
+    binary = binary or shutil.which("kapitsa") or "/opt/homebrew/bin/kapitsa"
+    if binary not in _kapitsa_help:
+        try:
+            env = dict(os.environ, KAPITSA_NO_AUTO_UPDATE="1", KAPITSA_NO_PROMPT="1")
+            text = subprocess.run([binary, "--help"], capture_output=True, timeout=15, env=env).stdout.decode(errors="replace")
+        except Exception:
+            text = ""
+        _kapitsa_help[binary] = {m.group(1): float(m.group(2)) for m in
+                                 re.finditer(r"^  ([a-z0-9][\w.\-]*)\s+\([^)]+\)\s+([\d.]+) GB", text, re.M)}
+    return _kapitsa_help[binary]
+
+
+@functools.lru_cache(maxsize=1)
+def _ram_gb():
+    try:
+        return int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, timeout=5).stdout) / 1024 ** 3
+    except Exception:
+        return 0
+
+
+def _fit_gb(ram):
+    """The largest model that runs well: Kapitsa uses about 3/4 of the memory for the GPU, and needs some for context."""
+    return ram * 0.75 - 6 if ram else float("inf")
+
+
+def _last_line(path):
+    """The last line of a log (Kapitsa's download / load progress), without terminal colors."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - 4096))
+            tail = f.read().decode(errors="replace")
+    except (OSError, TypeError):
+        return None
+    lines = [re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", l).strip() for l in re.split(r"[\r\n]+", tail)]
+    lines = [l for l in lines if l]
+    return lines[-1][:200] if lines else None
+
+
+def parse_address(text):
+    """(host, port) from what people paste: "http://10.0.2.50:11434/v1", "10.0.2.50:1234", "localhost 8000",
+    ":8000", "[::1]:8000", or just "8000" (this Mac). Raises ValueError with a sentence the app can show."""
+    t = str(text or "").strip()
+    t = re.sub(r"^[a-zA-Z]+://", "", t).split("/")[0].strip()
+    m = re.fullmatch(r"\[([0-9a-fA-F:]+)\](?::(\d+))?", t) or re.fullmatch(r"([^\s:]*)(?:[:\s]+(\d+))?", t)
+    host, port = (m.group(1), m.group(2)) if m else ("", None)
+    if host.isdigit() and port is None:  # just a port
+        host, port = "127.0.0.1", host
+    host = host or "127.0.0.1"
+    if host == "localhost":
+        host = "127.0.0.1"
+    if port is None:
+        port = "443" if str(text).strip().lower().startswith("https://") else "80" if "://" in str(text) else None
+    if not port or not 1 <= int(port) <= 65535 or not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", host):
+        raise ValueError("type an address with a port, like 10.0.2.50:11434 or http://10.0.2.50:1234/v1")
+    return host, int(port)

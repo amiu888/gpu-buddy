@@ -38,6 +38,24 @@ struct RouterStatus: Decodable {
         let network: Bool?
         let manual: Bool?
         let name: String
+        let choices: [Choice]?      // Kapitsa: the models it can switch to
+        let switching: Switching?   // Kapitsa: changing model right now
+        let start_file: String?
+    }
+    struct Choice: Decodable, Identifiable {
+        let id: String
+        let name: String
+        let about: String
+        let size_gb: Double?
+        let downloaded: Bool
+        let fits: Bool
+        let active: Bool
+    }
+    struct Switching: Decodable {
+        let to: String
+        let seconds: Int
+        let download_gb: Double?
+        let last_line: String?
     }
     struct Key: Decodable, Identifiable {
         let id: String
@@ -74,6 +92,7 @@ struct RouterStatus: Decodable {
     let servers: [Server]?
     let keys: [Key]?
     let clients: [Client]?
+    let hidden_servers: [String]?
 }
 
 @MainActor
@@ -144,6 +163,33 @@ final class RouterModel: ObservableObject {
         let reach = route.target == "auto" ? live : live.filter { $0.id == route.target }
         var seen = Set<String>()
         return reach.flatMap { $0.models }.filter { seen.insert($0).inserted }
+    }
+
+    struct Probe: Decodable {
+        let ok: Bool
+        let kind_name: String?
+        let icon: String?
+        let models: [String]?
+        let model_count: Int?
+        let error: String?
+    }
+
+    /// Ask gpud whether an LLM server answers at this address (without adding it).
+    func probe(_ address: String) async -> Probe? {
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["probe_server": address])
+        req.timeoutInterval = 30
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+            return Probe(ok: false, kind_name: nil, icon: nil, models: nil, model_count: nil, error: "The background service didn't answer.")
+        }
+        let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if (resp as? HTTPURLResponse)?.statusCode != 200 {
+            return Probe(ok: false, kind_name: nil, icon: nil, models: nil, model_count: nil, error: obj?["error"] as? String)
+        }
+        guard let p = obj?["probe"], let pd = try? JSONSerialization.data(withJSONObject: p) else { return nil }
+        return try? JSONDecoder().decode(Probe.self, from: pd)
     }
 
     func serverLabel(_ s: RouterStatus.Server) -> String { "\(s.icon ?? "🧠") \(s.name)  :\(s.port)" + (s.up ? "" : "  (not running)") }
@@ -282,6 +328,7 @@ struct RouterView: View {
     @StateObject private var m = RouterModel()
     @State private var pick: RouterPick? = RouterView.startPick()
     @State private var showModels = ProcessInfo.processInfo.environment["GPUBUDDY_MODELS_TAB"] != nil
+    @State private var removeServer: RouterStatus.Server?
     private static let startTab = ModelsTab.allCases.first { $0.rawValue == ProcessInfo.processInfo.environment["GPUBUDDY_MODELS_TAB"] } ?? .inUse
 
     /// For checking layouts: GPUBUDDY_ROUTER_PICK=allowed | thisMac | newRoute | newKey | addServer | route:ID | server:ID
@@ -519,31 +566,59 @@ struct RouterView: View {
             if m.servers.isEmpty {
                 Text("Looking…").font(small).foregroundColor(.white.opacity(0.5)).frame(width: 230, alignment: .leading)
             }
-            ForEach(m.servers) { s in
-                Card(id: "s:" + s.id, selected: pick == .server(s.id), tint: s.up ? green : .gray, dim: !s.up,
-                     action: { pick = .server(s.id) }) {
-                    HStack {
-                        Text("\(s.icon ?? "🧠")  \(s.name)").font(label).lineLimit(1)
-                        Spacer()
-                        Text(verbatim: ":\(s.port)").font(mono).foregroundColor(.white.opacity(0.8))
-                    }
-                    HStack(spacing: 6) {
-                        Circle().fill(s.up ? green : .gray).frame(width: 6, height: 6)
-                        Text(s.up ? (s.any_model == true ? "Running · answers any model name"
-                                     : "Running · \(s.models.count) model\(s.models.count == 1 ? "" : "s")") : "Not running")
-                            .font(small).foregroundColor(.white.opacity(0.6))
-                    }
-                    if let first = s.models.first, s.up {
-                        Text(shortModel(first) + (s.models.count > 1 ? " +\(s.models.count - 1)" : ""))
-                            .font(.system(size: 9, design: .monospaced)).foregroundColor(.white.opacity(0.45)).lineLimit(1)
-                    }
-                    if s.network == true {
-                        Text("⚠️ Also open to the network directly").font(small).foregroundColor(.orange.opacity(0.9))
-                    }
-                }
-            }
+            ForEach(m.servers) { s in serverCard(s) }
             AddButton(title: "Add a server by address…") { pick = .addServer }
         }
+        .alert("Remove \(removeServer?.name ?? "") from the list?", isPresented: Binding(
+            get: { removeServer != nil }, set: { if !$0 { removeServer = nil } })) {
+            Button("Remove", role: .destructive) {
+                if let s = removeServer {
+                    Task { if await m.send(["remove_server": s.id]), pick == .server(s.id) { pick = nil } }
+                }
+                removeServer = nil
+            }
+            Button("Cancel", role: .cancel) { removeServer = nil }
+        } message: {
+            Text(removeNote(removeServer))
+        }
+    }
+
+    private func serverCard(_ s: RouterStatus.Server) -> some View {
+            Card(id: "s:" + s.id, selected: pick == .server(s.id), tint: s.up ? green : .gray, dim: !s.up,
+                 action: { pick = .server(s.id) }) {
+                HStack {
+                    Text("\(s.icon ?? "🧠")  \(s.name)").font(label).lineLimit(1)
+                    Spacer()
+                    Text(verbatim: ":\(s.port)").font(mono).foregroundColor(.white.opacity(0.8))
+                    Button {
+                        removeServer = s
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 11)).foregroundColor(.white.opacity(0.45))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Remove \(s.name) from the list")
+                }
+                HStack(spacing: 6) {
+                    Circle().fill(s.up ? green : .gray).frame(width: 6, height: 6)
+                    Text(s.up ? (s.any_model == true ? "Running · answers any model name"
+                                 : "Running · \(s.models.count) model\(s.models.count == 1 ? "" : "s")") : "Not running")
+                        .font(small).foregroundColor(.white.opacity(0.6))
+                }
+                if let first = s.models.first, s.up {
+                    Text(shortModel(first) + (s.models.count > 1 ? " +\(s.models.count - 1)" : ""))
+                        .font(.system(size: 9, design: .monospaced)).foregroundColor(.white.opacity(0.45)).lineLimit(1)
+                }
+                if s.network == true {
+                    Text("⚠️ Also open to the network directly").font(small).foregroundColor(.orange.opacity(0.9))
+                }
+            }
+    }
+
+    private func removeNote(_ s: RouterStatus.Server?) -> String {
+        guard let s else { return "" }
+        if s.manual == true { return "GPU Buddy stops checking \(s.host):\(s.port). The server itself isn't changed." }
+        if s.up { return "The server keeps running; GPU Buddy just stops listing and routing to it. Add it again by address to bring it back." }
+        return "It isn't running. If it starts again, GPU Buddy finds it again."
     }
 
     private var blockedDevices: [RouterStatus.Client] {
@@ -1027,17 +1102,14 @@ private struct ServerPanel: View {
             if s.any_model == true {
                 Note(text: "Kapitsa runs one model and answers whatever model name a request uses.")
             }
-
-            Text("Models (\(s.models.count))").font(label).padding(.top, 4)
-            if s.models.isEmpty {
-                Note(text: s.up ? "None loaded or downloaded." : "Unknown while it's not running.")
+            if let choices = s.choices, !choices.isEmpty {
+                KapitsaModelPicker(m: m, s: s, choices: choices)
             }
-            ForEach(s.models.prefix(40), id: \.self) { mdl in
-                HStack {
-                    Text(mdl).font(.system(size: 9.5, design: .monospaced)).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
-                    Spacer()
-                    CopyButton(text: mdl)
-                }
+
+            if s.kind == "ollama" && s.port == 11434 && ["127.0.0.1", "localhost"].contains(s.host) {
+                OllamaModelsSection()
+            } else {
+                modelList
             }
 
             Text("Name in GPU Buddy").font(label).padding(.top, 4)
@@ -1046,39 +1118,305 @@ private struct ServerPanel: View {
                 Button("Rename") { Task { await m.send(["server_name": ["id": s.id, "name": name]]) } }
                     .disabled(name == s.name)
             }
-            if s.manual == true {
-                Button(role: .destructive) {
-                    Task { if await m.send(["remove_server": s.id]) { onRemove() } }
-                } label: { Text("Forget this server") }
-            }
+            Button(role: .destructive) {
+                Task { if await m.send(["remove_server": s.id]) { onRemove() } }
+            } label: { Text("Remove from list") }
+            .padding(.top, 4)
         }
         .onAppear { name = s.name }
+    }
+
+    @ViewBuilder private var modelList: some View {
+        Text("Models (\(s.models.count))").font(label).padding(.top, 4)
+        if s.models.isEmpty {
+            Note(text: s.up ? "None loaded or downloaded." : "Unknown while it's not running.")
+        }
+        ForEach(s.models.prefix(40), id: \.self) { mdl in
+            HStack {
+                Text(mdl).font(.system(size: 9.5, design: .monospaced)).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                Spacer()
+                CopyButton(text: mdl)
+            }
+        }
+    }
+}
+
+/// Ollama's models: the ones on this Mac, and everything ollama.com offers, to download with one click.
+private struct OllamaModelsSection: View {
+    @StateObject private var mm = ModelsModel()
+    @State private var search = ""
+    @State private var ask: (name: String, note: String)?
+
+    private var installed: [ModelsStatus.Installed] { (mm.st?.installed ?? []).filter { $0.server == "Ollama" } }
+    private var library: [ModelsStatus.Lib] {
+        let all = mm.st?.library ?? []
+        let q = search.trimmingCharacters(in: .whitespaces)
+        return q.isEmpty ? all : all.filter { $0.name.localizedCaseInsensitiveContains(q) || $0.desc.localizedCaseInsensitiveContains(q) }
+    }
+    private var downloading: Bool { mm.st?.jobs.values.contains { $0.state == "running" } == true }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("On this Mac (\(installed.count))").font(label).padding(.top, 4)
+            if mm.st == nil { ProgressView().controlSize(.small) }
+            ForEach(installed) { r in installedRow(r) }
+
+            Text("Available on ollama.com (\(mm.st?.library.count ?? 0))").font(label).padding(.top, 8)
+            TextField("Search, e.g. qwen, coder, vision", text: $search).textFieldStyle(.roundedBorder)
+            if let e = mm.st?.library_error, mm.st?.library.isEmpty == true { Note(text: "Couldn't load the list: \(e)") }
+            if mm.st?.library_loading == true && mm.st?.library.isEmpty == true { Note(text: "Loading the list from ollama.com…") }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(library.prefix(80)) { lib in libraryRow(lib) }
+                    if library.count > 80 { Note(text: "\(library.count - 80) more: search to narrow the list.") }
+                }
+            }
+            .frame(maxHeight: 340)
+            if let p = mm.problem { Note(text: "⚠️ " + p).foregroundColor(.orange) }
+        }
+        .task {
+            await mm.refresh()
+            while !Task.isCancelled {  // faster while something downloads
+                try? await Task.sleep(nanoseconds: (downloading ? 2 : 10) * 1_000_000_000)
+                await mm.refresh()
+            }
+        }
+        .alert(ask?.name ?? "", isPresented: Binding(get: { ask != nil }, set: { if !$0 { ask = nil } })) {
+            Button("Download") {
+                if let a = ask { Task { await mm.send(["pull": a.name, "from": "ollama"]) } }
+                ask = nil
+            }
+            Button("Cancel", role: .cancel) { ask = nil }
+        } message: { Text(ask?.note ?? "") }
+    }
+
+    private func installedRow(_ r: ModelsStatus.Installed) -> some View {
+        let info = [r.params ?? "", r.quant ?? ""].filter { !$0.isEmpty }.joined(separator: " · ")
+        return HStack(spacing: 6) {
+            Text(r.name).font(.system(size: 10, design: .monospaced)).lineLimit(1).textSelection(.enabled)
+            if r.loaded == true { Text("in memory").font(small).foregroundColor(green) }
+            Spacer()
+            Text(info + "  " + gb(r.size)).font(small).foregroundColor(.secondary)
+            CopyButton(text: r.name)
+        }
+    }
+
+    private func libraryRow(_ lib: ModelsStatus.Lib) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(lib.name).font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                ForEach(lib.caps, id: \.self) { c in
+                    Text(c).font(.system(size: 8.5)).padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(Capsule().fill(Color.white.opacity(0.08)))
+                }
+                Spacer()
+                Text(lib.pulls + " pulls").font(.system(size: 9)).foregroundColor(.secondary)
+            }
+            Text(lib.desc).font(.system(size: 9.5)).foregroundColor(.secondary).lineLimit(2)
+            HStack(spacing: 4) {
+                ForEach(lib.sizes.isEmpty ? ["latest"] : lib.sizes, id: \.self) { size in sizeChip(lib.name, size) }
+            }
+        }
+    }
+
+    @ViewBuilder private func sizeChip(_ model: String, _ size: String) -> some View {
+        let name = model + ":" + size
+        if mm.installedNames.contains(name) {
+            Button { copy(name) } label: { Text("✓ " + size).font(.system(size: 10, weight: .semibold, design: .monospaced)) }
+                .buttonStyle(.plain).foregroundColor(green)
+                .padding(.horizontal, 7).padding(.vertical, 3).background(Capsule().fill(green.opacity(0.15)))
+                .help("On this Mac. Click to copy “\(name)”.")
+        } else if let j = mm.job(name), j.state == "running" {
+            Text("↓ \(size) " + (j.total > 0 ? "\(Int(Double(j.done) / Double(max(j.total, 1)) * 100))%" : "…"))
+                .font(.system(size: 10, design: .monospaced)).padding(.horizontal, 7).padding(.vertical, 3)
+                .background(Capsule().fill(Color.accentColor.opacity(0.25)))
+        } else {
+            Button {
+                let est = estimateDownload(size).map { " (about \($0))" } ?? ""
+                let ram = ProcessInfo.processInfo.physicalMemory / 1_073_741_824
+                ask = (name, "Ollama downloads it from ollama.com\(est). Then any app can use it as “\(name)”. This Mac has \(ram) GB of memory.")
+            } label: { Text(size).font(.system(size: 10, design: .monospaced)) }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 7).padding(.vertical, 3).background(Capsule().fill(Color.white.opacity(0.1)))
+                .help("Download \(name)")
+        }
+    }
+}
+
+/// Rough download size for a 4-bit model of this many parameters ("8b", "e4b", "8x7b", "270m").
+private func estimateDownload(_ size: String) -> String? {
+    let s = size.lowercased()
+    var n: Double?
+    if s.hasSuffix("b") { n = Double(s.dropFirst(s.hasPrefix("e") ? 1 : 0).dropLast().split(separator: "x").map { Double($0) ?? 0 }.reduce(1, *)) }
+    if s.hasSuffix("m") { n = (Double(s.dropLast()) ?? 0) / 1000 }
+    guard let n, n > 0 else { return nil }
+    return gb(Int64(n * 0.62e9))
+}
+
+/// Pick the model Kapitsa serves. gpud edits the --model line of Kapitsa's start script and restarts it.
+private struct KapitsaModelPicker: View {
+    @ObservedObject var m: RouterModel
+    let s: RouterStatus.Server
+    let choices: [RouterStatus.Choice]
+    @State private var pick = ""
+    @State private var confirm = false
+
+    private var current: RouterStatus.Choice? { choices.first { $0.active } }
+    private var picked: RouterStatus.Choice? { choices.first { $0.id == pick } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Model").font(label).padding(.top, 4)
+            if let sw = s.switching {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(sw.download_gb.map { String(format: "Downloading and starting %@ (%.0f GB)…", sw.to, $0) }
+                         ?? "Starting \(sw.to)…").font(small)
+                    Spacer()
+                    Text(minutes(sw.seconds)).font(small).foregroundColor(.secondary)
+                }
+                if let line = sw.last_line {
+                    Text(line).font(.system(size: 9.5, design: .monospaced)).foregroundColor(.secondary)
+                        .lineLimit(2).textSelection(.enabled)
+                }
+                Note(text: "Requests wait or fail until it has loaded. Apps don't need new settings: Kapitsa answers any model name.")
+            } else {
+                Picker("", selection: $pick) {
+                    ForEach(choices) { c in
+                        Text(row(c)).tag(c.id).disabled(!c.fits)
+                    }
+                }
+                .labelsHidden()
+                if let c = picked {
+                    Note(text: c.about)
+                    if !c.fits {
+                        Note(text: "Too big for this Mac's memory.").foregroundColor(.orange)
+                    }
+                }
+                Button(picked.map { $0.downloaded ? "Switch to \($0.name)" : "Download and switch" } ?? "Switch") {
+                    if picked?.downloaded == false { confirm = true } else { go() }
+                }
+                .disabled(picked == nil || picked?.active == true || picked?.fits == false || m.busy)
+                if let f = s.start_file {
+                    Note(text: "Changes the --model line in \(f) (a backup is kept) and restarts Kapitsa.")
+                }
+            }
+        }
+        .onAppear { pick = current?.id ?? choices.first?.id ?? "" }
+        .onChange(of: current?.id) { _, id in if let id { pick = id } }
+        .alert("Download \(picked?.name ?? "")?", isPresented: $confirm) {
+            Button("Download and switch") { go() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(String(format: "Kapitsa downloads about %.0f GB the first time, then starts it. Your current model stays on disk, so you can switch back.",
+                        picked?.size_gb ?? 0))
+        }
+    }
+
+    private func row(_ c: RouterStatus.Choice) -> String {
+        var t = c.name
+        if let gb = c.size_gb { t += String(format: "  ·  %.1f GB", gb) }
+        if c.active { t += "  ·  running" } else if !c.fits { t += "  ·  too big" } else if !c.downloaded { t += "  ·  download" }
+        return t
+    }
+
+    private func minutes(_ s: Int) -> String { s < 60 ? "\(s) s" : "\(s / 60) min \(s % 60) s" }
+
+    private func go() {
+        Task { await m.send(["kapitsa_model": ["server": s.id, "model": pick]]) }
     }
 }
 
 private struct AddServerPanel: View {
     @ObservedObject var m: RouterModel
     let onDone: () -> Void
-    @State private var host = "127.0.0.1"
-    @State private var port = ""
+    @State private var address = ""
     @State private var name = ""
+    @State private var probe: RouterModel.Probe?
+    @State private var checking = false
+
+    /// Common servers and their usual ports: a click fills in the address.
+    private static let presets: [(String, String, Int)] = [
+        ("🦙", "Ollama", 11434), ("🧪", "LM Studio", 1234), ("⚡", "Kapitsa", 8000),
+        ("🦙", "llama.cpp", 8080), ("🍎", "MLX", 8080), ("🚀", "vLLM", 8000),
+    ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             PanelTitle(icon: "➕", title: "Add a server")
-            Note(text: "GPU Buddy finds most servers by itself (Kapitsa, Ollama, LM Studio, llama.cpp, MLX, vLLM…). Add one here if it's missing, or if it runs on another computer. It must answer the OpenAI API (GET /v1/models).")
+            Note(text: "GPU Buddy finds servers on this Mac by itself. Add one here if it's missing, or if it runs on another computer (a NAS, another Mac, a PC).")
+
             Text("Address").font(label)
-            HStack {
-                TextField("127.0.0.1", text: $host).textFieldStyle(.roundedBorder).font(mono)
-                Text(":")
-                TextField("8000", text: $port).textFieldStyle(.roundedBorder).font(mono).frame(width: 80)
+            TextField("e.g. 10.0.2.50:11434 or http://nas.local:1234/v1", text: $address)
+                .textFieldStyle(.roundedBorder).font(mono)
+                .onSubmit { check() }
+                .onChange(of: address) { _, _ in probe = nil }
+            Text("Paste a whole URL, or type host:port. Just a port means this Mac.").font(small).foregroundColor(.secondary)
+
+            Text("Or start from a common server").font(label).padding(.top, 2)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 6)], alignment: .leading, spacing: 6) {
+                ForEach(Self.presets, id: \.1) { icon, kind, port in
+                    Button { fill(kind, port) } label: {
+                        Text("\(icon) \(kind)  :\(port)").font(.system(size: 10, design: .rounded)).frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain).padding(.horizontal, 7).padding(.vertical, 4)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.08)))
+                }
             }
-            Text("Name (optional)").font(label)
+
+            if let hidden = m.st?.hidden_servers, !hidden.isEmpty {
+                Text("Removed earlier").font(label).padding(.top, 2)
+                ForEach(hidden, id: \.self) { sid in
+                    HStack {
+                        Text(sid).font(mono)
+                        Spacer()
+                        Button("Add back") { Task { if await m.send(["add_server": ["address": sid]]) { onDone() } } }.controlSize(.small)
+                    }
+                }
+            }
+
+            Text("Name (optional)").font(label).padding(.top, 2)
             TextField("e.g. NAS Ollama", text: $name).textFieldStyle(.roundedBorder)
-            Button("Add") {
-                Task { if await m.send(["add_server": ["host": host, "port": Int(port) ?? 0, "name": name]]) { onDone() } }
+
+            if let p = probe {
+                if p.ok {
+                    Text("✓ \(p.icon ?? "🧠") \(p.kind_name ?? "LLM server") answers, with \(p.model_count ?? 0) model\(p.model_count == 1 ? "" : "s")"
+                         + ((p.models ?? []).isEmpty ? "" : ": " + (p.models ?? []).prefix(3).joined(separator: ", ")))
+                        .font(small).foregroundColor(green).fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("⚠️ " + (p.error ?? "No answer.")).font(small).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+                }
             }
-            .buttonStyle(.borderedProminent).disabled(Int(port) == nil || host.isEmpty)
+            HStack {
+                Button(checking ? "Checking…" : "Test") { check() }
+                    .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty || checking)
+                Button(probe?.ok == false ? "Add anyway" : "Add") {
+                    Task { if await m.send(["add_server": ["address": address, "name": name]]) { onDone() } }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty || checking)
+            }
+        }
+    }
+
+    private func fill(_ kind: String, _ port: Int) {
+        // Keep a host already typed (another computer); else this Mac.
+        var host = address.trimmingCharacters(in: .whitespaces)
+        if let r = host.range(of: "://") { host = String(host[r.upperBound...]) }
+        host = String(host.split(separator: "/").first ?? "")
+        host = String(host.split(separator: ":").first ?? "")
+        if host.isEmpty || host.allSatisfy(\.isNumber) { host = "127.0.0.1" }
+        address = "\(host):\(port)"
+        if name.isEmpty || Self.presets.contains(where: { $0.1 == name }) { name = kind }
+        check()
+    }
+
+    private func check() {
+        let a = address
+        checking = true
+        Task {
+            probe = await m.probe(a)
+            checking = false
         }
     }
 }
