@@ -1,6 +1,10 @@
 #!/bin/bash
 # Installs gpud as a launchd agent (starts at login, restarts if it dies) and builds GPU Buddy.app.
+#   ./install.sh --service-only   installs just gpud (no app build, no compiler needed), e.g. for the
+#                                 Mac App Store edition of GPU Buddy, which can't install it itself.
 set -euo pipefail
+SERVICE_ONLY=0
+[ "${1:-}" = "--service-only" ] && SERVICE_ONLY=1
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 LABEL="local.gpubuddy.gpud"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -28,6 +32,13 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "gpud installed: http://127.0.0.1:$PORT/api/v1/status (logs: ~/Library/Logs/gpud.log)"
 
+if [ "$SERVICE_ONLY" = 1 ]; then
+    sleep 2
+    echo "Pairing code for watching this Mac from another one:"
+    /usr/bin/python3 "$ROOT/daemon/gpud.py" --pairing-code || true
+    echo "Open GPU Buddy: it finds gpud on this Mac by itself."
+    exit 0
+fi
 "$ROOT/app/build.sh"
 sleep 2
 echo "Pairing code for watching this Mac from another one (GPU Buddy → Macs):"
