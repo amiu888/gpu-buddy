@@ -328,6 +328,14 @@ final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     private let pin: String?
     /// Set for the Demo Mac: answers come from built-in sample data and nothing touches the network.
     private let demo: DemoFeed?
+    #if APPSTORE
+    /// App Store edition, this Mac only: when no gpud answers on loopback, GPU load and memory come straight
+    /// from IOKit inside the sandbox (see NativeFeed), so the app works before gpud is installed.
+    private let native: NativeFeed?
+    private var _usingNative = false
+    /// The last answer came from the built-in readings, not from gpud.
+    var usingNative: Bool { lock.withLock { _usingNative } }
+    #endif
     private let lock = NSLock()
     private var _problem: String?
     private var pinFailed = false
@@ -344,6 +352,9 @@ final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
 
     init(host: HostRecord, localPort: Int) {
         demo = host.isDemo ? DemoFeed() : nil
+        #if APPSTORE
+        native = host.isLocal ? NativeFeed.shared : nil
+        #endif
         if host.isDemo {
             base = "demo:"
             token = nil
@@ -370,9 +381,18 @@ final class APIClient: NSObject, URLSessionDelegate, @unchecked Sendable {
             let (data, resp) = try await session.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             lock.withLock { _problem = code == 200 ? nil : code == 401 ? "pairing code not accepted" : "error \(code)" }
+            #if APPSTORE
+            lock.withLock { _usingNative = false }
+            #endif
             return code == 200 ? try? JSONDecoder().decode(T.self, from: data) : nil
         } catch {
             if Task.isCancelled { return nil }
+            #if APPSTORE
+            if let native, let data = native.response(path) {
+                lock.withLock { _usingNative = true; _problem = nil }
+                return try? JSONDecoder().decode(T.self, from: data)
+            }
+            #endif
             lock.withLock {
                 _problem = pinFailed ? "its certificate doesn't match the pairing code" : pin == nil ? "gpud isn't running" : "offline"
             }
@@ -3255,7 +3275,9 @@ func bigNumber(_ v: Double) -> String {
 @MainActor func hype(_ store: GPUStore, tick: Int) -> String {
     guard store.online, let s = store.shown else {
         if store.host.isLocal {
-            #if os(macOS)
+            #if APPSTORE
+            return "Install gpud from GitHub to wake me up (Help › Getting Started) 🔌"
+            #elseif os(macOS)
             return Service.isInstalled ? "gpud is starting… (logs: ~/Library/Logs/gpud.log) 🔌"
                                        : "Install the background service (GPU Buddy menu) to wake me up 🔌"
             #else
@@ -3968,10 +3990,12 @@ struct RequestLogView: View {
                 Text("Kept on this Mac for 7 days. Snippets appear only when “Keep the first 100 characters” is on in Settings.")
                     .font(.system(size: 10, design: .rounded)).foregroundColor(.white.opacity(0.45))
                 Spacer()
+                #if !APPSTORE
                 Button("Show the file in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: NSHomeDirectory()
                         + "/Library/Application Support/GPUBuddy/llm-requests.jsonl")])
                 }
+                #endif
             }
         }
         .padding(.horizontal, 16).padding(.bottom, 12)
